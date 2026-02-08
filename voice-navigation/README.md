@@ -2,6 +2,8 @@
 
 A **push-to-talk voice command** widget for the ServiceNow Service Portal. Navigate pages, search records, create items, and perform actions using natural speech or a keyboard-driven command palette.
 
+> **Tutorial:** See [Voice Navigation docs.docx](Voice%20Navigation%20docs.docx) for a full walkthrough with screenshots.
+
 ---
 
 ## Features

@@ -2,6 +2,8 @@
 
 A full-featured **Daily Standup (DSU)** widget for the ServiceNow Service Portal. Provides a structured standup experience with blocker escalation, team reactions, analytics, and manager oversight.
 
+![Team Standup Board](screenshot.png)
+
 ---
 
 ## Features

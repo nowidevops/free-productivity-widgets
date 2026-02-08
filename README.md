@@ -45,4 +45,4 @@ These widgets are **community contributions** and are not affiliated with, endor
 
 ---
 
-Built with purpose by **iDevOps LLC**
+Built with purpose by **iDevOps LLC** | [YouTube - @AgenticServiceNow](https://www.youtube.com/@AgenticServiceNow)

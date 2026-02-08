@@ -1,0 +1,2967 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<unload unload_date="2026-02-08 08:43:00">
+<sp_widget action="INSERT_OR_UPDATE">
+<category>custom</category>
+<client_script><![CDATA[api.controller = function($scope, $interval, $timeout, $window, $sce, spUtil) {
+  var c = this;
+
+  // ---- Initialize Data ----
+  c.data = c.data || {};
+  c.data.logEntries = c.data.logEntries || [];
+  c.data.stats = c.data.stats || {};
+  c.data.trendData = c.data.trendData || [];
+  c.data.sourcesAvailable = c.data.sourcesAvailable || [];
+  c.data.totalRecords = c.data.totalRecords || 0;
+
+  // ---- State Variables ----
+  c.loading = false;
+  c.exporting = false;
+  c.showStats = true;
+  c.showFilters = true;
+  c.refreshTimer = null;
+  c.toastTimer = null;
+
+  // ---- Toast Notification ----
+  c.toast = { show: false, message: '', type: 'info' };
+
+  // ---- Load User Preferences from localStorage ----
+  var PREF_KEY = 'slv_user_preferences';
+
+  function loadPreferences() {
+    try {
+      var stored = $window.localStorage.getItem(PREF_KEY);
+      if (stored) {
+        return JSON.parse(stored);
+      }
+    } catch (e) { /* ignore parse errors */ }
+    return null;
+  }
+
+  var savedPrefs = loadPreferences();
+
+  // ---- Filter Defaults ----
+  c.filters = {
+    logSource: '',
+    severity: {
+      info: true,
+      warning: true,
+      error: true,
+      critical: true
+    },
+    timeRange: '24h',
+    sourceApp: '',
+    keyword: '',
+    dateFrom: null,
+    dateTo: null
+  };
+
+  // ---- Pagination Defaults ----
+  c.pagination = {
+    currentPage: 1,
+    pageSize: 50
+  };
+
+  // ---- Refresh Interval Default ----
+  c.refreshInterval = '60000';
+
+  // ---- Sort State ----
+  c.sort = {
+    field: 'sys_created_on',
+    direction: 'desc'
+  };
+
+  // ---- Apply Saved Preferences ----
+  if (savedPrefs) {
+    if (savedPrefs.filters) angular.merge(c.filters, savedPrefs.filters);
+    if (savedPrefs.pagination && savedPrefs.pagination.pageSize) {
+      c.pagination.pageSize = savedPrefs.pagination.pageSize;
+    }
+    if (savedPrefs.refreshInterval) c.refreshInterval = savedPrefs.refreshInterval;
+    if (typeof savedPrefs.showStats !== 'undefined') c.showStats = savedPrefs.showStats;
+  }
+
+  // ---- Utility: Show Toast ----
+  function showToast(message, type) {
+    c.toast.message = message;
+    c.toast.type = type || 'info';
+    c.toast.show = true;
+    if (c.toastTimer) $timeout.cancel(c.toastTimer);
+    c.toastTimer = $timeout(function() {
+      c.toast.show = false;
+    }, 4000);
+  }
+
+  c.getToastIcon = function() {
+    var icons = {
+      'success': 'fa-check-circle',
+      'error': 'fa-exclamation-circle',
+      'warning': 'fa-exclamation-triangle',
+      'info': 'fa-info-circle'
+    };
+    return icons[c.toast.type] || 'fa-info-circle';
+  };
+
+  // ---- Severity Helpers ----
+  c.normalizeSeverity = function(level) {
+    if (!level) return 'info';
+    var l = String(level).toLowerCase();
+    if (l === '0' || l === 'critical' || l === 'fatal') return 'critical';
+    if (l === '1' || l === 'error' || l === 'err') return 'error';
+    if (l === '2' || l === 'warning' || l === 'warn') return 'warning';
+    return 'info';
+  };
+
+  c.getSeverityLabel = function(level) {
+    var map = { 'critical': 'Critical', 'error': 'Error', 'warning': 'Warning', 'info': 'Info' };
+    return map[c.normalizeSeverity(level)] || 'Info';
+  };
+
+  c.getSeverityIcon = function(level) {
+    var map = {
+      'critical': 'fa-fire',
+      'error': 'fa-times-circle',
+      'warning': 'fa-exclamation-triangle',
+      'info': 'fa-info-circle'
+    };
+    return map[c.normalizeSeverity(level)] || 'fa-info-circle';
+  };
+
+  c.getSeverityClass = function(level) {
+    return 'slv-row-' + c.normalizeSeverity(level);
+  };
+
+  // ---- Sort Helpers ----
+  c.sortBy = function(field) {
+    if (c.sort.field === field) {
+      c.sort.direction = c.sort.direction === 'asc' ? 'desc' : 'asc';
+    } else {
+      c.sort.field = field;
+      c.sort.direction = 'desc';
+    }
+    c.pagination.currentPage = 1;
+    c.fetchLogs();
+  };
+
+  c.getSortIcon = function(field) {
+    if (c.sort.field !== field) return 'fa-sort';
+    return c.sort.direction === 'asc' ? 'fa-sort-asc' : 'fa-sort-desc';
+  };
+
+  c.getSortAriaLabel = function(field) {
+    if (c.sort.field !== field) return 'none';
+    return c.sort.direction === 'asc' ? 'ascending' : 'descending';
+  };
+
+  // ---- Time Ago Calculation ----
+  c.getTimeAgo = function(dateStr) {
+    if (!dateStr) return '';
+    try {
+      var then = new Date(dateStr.replace(/-/g, '/'));
+      var now = new Date();
+      var diffMs = now - then;
+      var diffSec = Math.floor(diffMs / 1000);
+      if (diffSec < 60) return diffSec + 's ago';
+      var diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return diffMin + 'm ago';
+      var diffHr = Math.floor(diffMin / 60);
+      if (diffHr < 24) return diffHr + 'h ago';
+      var diffDay = Math.floor(diffHr / 24);
+      return diffDay + 'd ago';
+    } catch (e) {
+      return '';
+    }
+  };
+
+  // ---- Message Truncation ----
+  c.truncateMessage = function(message, expanded) {
+    if (!message) return '';
+    if (expanded) return message;
+    var MAX_LEN = 180;
+    if (message.length <= MAX_LEN) return message;
+    return message.substring(0, MAX_LEN) + '...';
+  };
+
+  // ---- Keyword Highlighting ----
+  c.highlightKeyword = function(text) {
+    if (!text) return '';
+    if (!c.filters.keyword || c.filters.keyword.length < 2) {
+      return $sce.trustAsHtml(c.escapeHtml(text));
+    }
+    var escaped = c.escapeHtml(text);
+    var kw = c.escapeHtml(c.filters.keyword);
+    var regex = new RegExp('(' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+    var highlighted = escaped.replace(regex, '<span class="slv-keyword-highlight">$1</span>');
+    return $sce.trustAsHtml(highlighted);
+  };
+
+  c.escapeHtml = function(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  };
+
+  // ---- Active Filter Count ----
+  c.getActiveFilterCount = function() {
+    var count = 0;
+    if (c.filters.logSource) count++;
+    if (c.filters.sourceApp) count++;
+    if (c.filters.keyword) count++;
+    if (c.filters.timeRange !== '24h') count++;
+    if (!c.filters.severity.info || !c.filters.severity.warning ||
+        !c.filters.severity.error || !c.filters.severity.critical) count++;
+    return count;
+  };
+
+  // ---- Pagination Helpers ----
+  c.getTotalPages = function() {
+    return Math.ceil((c.data.totalRecords || 0) / c.pagination.pageSize) || 1;
+  };
+
+  c.getShowingRange = function() {
+    if (!c.data.totalRecords) return '0';
+    var start = ((c.pagination.currentPage - 1) * c.pagination.pageSize) + 1;
+    var end = Math.min(c.pagination.currentPage * c.pagination.pageSize, c.data.totalRecords);
+    return start + '-' + end;
+  };
+
+  c.getPageNumbers = function() {
+    var total = c.getTotalPages();
+    var current = c.pagination.currentPage;
+    var pages = [];
+    var maxVisible = 7;
+
+    if (total <= maxVisible) {
+      for (var i = 1; i <= total; i++) pages.push(i);
+      return pages;
+    }
+
+    pages.push(1);
+    if (current > 3) pages.push('...');
+
+    var start = Math.max(2, current - 1);
+    var end = Math.min(total - 1, current + 1);
+
+    for (var j = start; j <= end; j++) pages.push(j);
+
+    if (current < total - 2) pages.push('...');
+    pages.push(total);
+
+    return pages;
+  };
+
+  c.goToPage = function(page) {
+    if (page === '...' || page < 1 || page > c.getTotalPages()) return;
+    c.pagination.currentPage = page;
+    c.fetchLogs();
+  };
+
+  c.changePageSize = function() {
+    c.pagination.currentPage = 1;
+    c.fetchLogs();
+  };
+
+  // ---- Bar Chart Height ----
+  c.getBarHeight = function(count) {
+    if (!c.data.trendData || c.data.trendData.length === 0) return 0;
+    var max = 0;
+    c.data.trendData.forEach(function(p) {
+      if (p.count > max) max = p.count;
+    });
+    if (max === 0) return 0;
+    return Math.max(2, (count / max) * 100);
+  };
+
+  // ---- Data Fetching ----
+  c.fetchLogs = function() {
+    c.loading = true;
+    var params = {
+      action: 'fetch_logs',
+      filters: angular.copy(c.filters),
+      pagination: {
+        currentPage: c.pagination.currentPage,
+        pageSize: parseInt(c.pagination.pageSize, 10)
+      },
+      sort: angular.copy(c.sort)
+    };
+
+    c.server.get(params).then(function(response) {
+      c.data.logEntries = response.data.logEntries || [];
+      c.data.totalRecords = response.data.totalRecords || 0;
+      c.data.stats = response.data.stats || {};
+      c.data.trendData = response.data.trendData || [];
+      c.data.sourcesAvailable = response.data.sourcesAvailable || c.data.sourcesAvailable;
+      c.data.lastRefreshed = new Date().toLocaleTimeString();
+      c.loading = false;
+    }, function(error) {
+      c.loading = false;
+      showToast('Error loading log data. Please try again.', 'error');
+    });
+  };
+
+  // ---- Refresh ----
+  c.refreshLogs = function() {
+    c.fetchLogs();
+  };
+
+  // ---- Apply Filters ----
+  c.applyFilters = function() {
+    c.pagination.currentPage = 1;
+    c.fetchLogs();
+  };
+
+  // ---- Reset Filters ----
+  c.resetFilters = function() {
+    c.filters = {
+      logSource: '',
+      severity: { info: true, warning: true, error: true, critical: true },
+      timeRange: '24h',
+      sourceApp: '',
+      keyword: '',
+      dateFrom: null,
+      dateTo: null
+    };
+    c.pagination.currentPage = 1;
+    c.fetchLogs();
+    showToast('Filters have been reset.', 'info');
+  };
+
+  // ---- Auto-Refresh ----
+  c.setRefreshInterval = function() {
+    if (c.refreshTimer) {
+      $interval.cancel(c.refreshTimer);
+      c.refreshTimer = null;
+    }
+    var intervalMs = parseInt(c.refreshInterval, 10);
+    if (intervalMs > 0) {
+      c.refreshTimer = $interval(function() {
+        c.fetchLogs();
+      }, intervalMs);
+      showToast('Auto-refresh set to ' + (intervalMs / 1000) + ' seconds.', 'info');
+    } else {
+      showToast('Auto-refresh disabled.', 'info');
+    }
+  };
+
+  // ---- Expand/Collapse Log Entry ----
+  c.toggleExpand = function(entry) {
+    entry.expanded = !entry.expanded;
+    if (entry.expanded && entry.transaction_id && !entry.transactionLogs) {
+      c.loadTransactionContext(entry);
+    }
+  };
+
+  // ---- Load Transaction Context ----
+  c.loadTransactionContext = function(entry) {
+    entry.loadingContext = true;
+    c.server.get({
+      action: 'load_transaction_context',
+      transaction_id: entry.transaction_id,
+      current_sys_id: entry.sys_id
+    }).then(function(response) {
+      entry.transactionLogs = response.data.transactionLogs || [];
+      entry.relatedRecords = response.data.relatedRecords || [];
+      entry.loadingContext = false;
+    }, function() {
+      entry.loadingContext = false;
+      showToast('Failed to load transaction context.', 'error');
+    });
+  };
+
+  // ---- Create Incident ----
+  c.createIncident = function(entry) {
+    c.server.get({
+      action: 'create_incident',
+      log_sys_id: entry.sys_id,
+      log_source: entry.logTable || 'syslog',
+      log_message: (entry.message || '').substring(0, 500),
+      log_level: entry.level,
+      log_created_on: entry.sys_created_on
+    }).then(function(response) {
+      if (response.data.incident_number) {
+        showToast('Incident ' + response.data.incident_number + ' created successfully.', 'success');
+      } else {
+        showToast('Failed to create incident.', 'error');
+      }
+    }, function() {
+      showToast('Error creating incident. Please try again.', 'error');
+    });
+  };
+
+  // ---- Acknowledge Entry ----
+  c.acknowledgeEntry = function(entry) {
+    entry.acknowledged = !entry.acknowledged;
+    showToast(
+      entry.acknowledged ? 'Log entry acknowledged.' : 'Acknowledgment removed.',
+      'success'
+    );
+  };
+
+  // ---- Copy to Clipboard ----
+  c.copyToClipboard = function(entry) {
+    var details = 'Sys ID: ' + entry.sys_id + '\n' +
+                  'Time: ' + entry.sys_created_on + '\n' +
+                  'Source: ' + entry.source + '\n' +
+                  'Level: ' + c.getSeverityLabel(entry.level) + '\n' +
+                  'Message: ' + entry.message + '\n';
+    if (entry.stack_trace) {
+      details += 'Stack Trace: ' + entry.stack_trace + '\n';
+    }
+    if (entry.transaction_id) {
+      details += 'Transaction ID: ' + entry.transaction_id + '\n';
+    }
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(details).then(function() {
+        showToast('Log details copied to clipboard.', 'success');
+      }, function() {
+        fallbackCopy(details);
+      });
+    } else {
+      fallbackCopy(details);
+    }
+  };
+
+  function fallbackCopy(text) {
+    var textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      showToast('Log details copied to clipboard.', 'success');
+    } catch (e) {
+      showToast('Failed to copy. Please copy manually.', 'warning');
+    }
+    document.body.removeChild(textarea);
+  }
+
+  // ---- Export Data ----
+  c.exportData = function(format) {
+    c.exporting = true;
+    c.server.get({
+      action: 'export_data',
+      format: format,
+      filters: angular.copy(c.filters),
+      sort: angular.copy(c.sort)
+    }).then(function(response) {
+      c.exporting = false;
+      if (response.data.exportContent) {
+        var blob, filename, mimeType;
+        if (format === 'csv') {
+          mimeType = 'text/csv;charset=utf-8;';
+          filename = 'system_logs_' + new Date().toISOString().slice(0,10) + '.csv';
+          blob = new Blob([response.data.exportContent], { type: mimeType });
+        } else {
+          mimeType = 'application/json;charset=utf-8;';
+          filename = 'system_logs_' + new Date().toISOString().slice(0,10) + '.json';
+          blob = new Blob([response.data.exportContent], { type: mimeType });
+        }
+        var link = document.createElement('a');
+        if (link.download !== undefined) {
+          var url = URL.createObjectURL(blob);
+          link.setAttribute('href', url);
+          link.setAttribute('download', filename);
+          link.style.visibility = 'hidden';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        }
+        showToast('Export downloaded: ' + filename, 'success');
+      } else {
+        showToast('Export failed. No data returned.', 'error');
+      }
+    }, function() {
+      c.exporting = false;
+      showToast('Export failed. Please try again.', 'error');
+    });
+  };
+
+  // ---- Save Preferences ----
+  c.savePreferences = function() {
+    try {
+      var prefs = {
+        filters: angular.copy(c.filters),
+        pagination: { pageSize: c.pagination.pageSize },
+        refreshInterval: c.refreshInterval,
+        showStats: c.showStats
+      };
+      // Clean date objects for serialization
+      delete prefs.filters.dateFrom;
+      delete prefs.filters.dateTo;
+      $window.localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
+      showToast('Preferences saved successfully.', 'success');
+    } catch (e) {
+      showToast('Failed to save preferences.', 'error');
+    }
+  };
+
+  // ---- Expose Math.abs to template ----
+  $scope.Math = Math;
+
+  // ---- Initialize: Start auto-refresh and load initial data ----
+  c.setRefreshInterval();
+
+  // ---- Cleanup on destroy ----
+  $scope.$on('$destroy', function() {
+    if (c.refreshTimer) {
+      $interval.cancel(c.refreshTimer);
+    }
+    if (c.toastTimer) {
+      $timeout.cancel(c.toastTimer);
+    }
+  });
+
+  // ---- Visibility API: pause auto-refresh when tab is hidden ----
+  var visibilityHandler = function() {
+    if (document.hidden) {
+      if (c.refreshTimer) {
+        $interval.cancel(c.refreshTimer);
+        c.refreshTimer = null;
+      }
+    } else {
+      c.setRefreshInterval();
+      c.fetchLogs();
+    }
+  };
+  document.addEventListener('visibilitychange', visibilityHandler);
+  $scope.$on('$destroy', function() {
+    document.removeEventListener('visibilitychange', visibilityHandler);
+  });
+};]]></client_script>
+<controller_as>c</controller_as>
+<css>/* ========================================
+   System Log Viewer Widget - CSS Styles
+   ======================================== */
+
+.syslog-viewer-widget {
+  /* CSS Variables - Scoped to widget root */
+  --slv-bg-primary: #ffffff;
+  --slv-bg-secondary: #f4f5f7;
+  --slv-bg-tertiary: #e8eaed;
+  --slv-bg-dark: #1a1a2e;
+  --slv-text-primary: #161616;
+  --slv-text-secondary: #525252;
+  --slv-text-muted: #8d8d8d;
+  --slv-text-inverse: #ffffff;
+  --slv-border-color: #e0e0e0;
+  --slv-border-radius: 6px;
+  --slv-border-radius-lg: 10px;
+
+  /* Severity Colors - WCAG AA compliant */
+  --slv-info-bg: #e8f0fe;
+  --slv-info-color: #0F62FE;
+  --slv-info-border: #a6c8ff;
+  --slv-warning-bg: #fef7e0;
+  --slv-warning-color: #8a6d00;
+  --slv-warning-border: #F1C21B;
+  --slv-warning-text: #000000;
+  --slv-error-bg: #fde8e8;
+  --slv-error-color: #DA1E28;
+  --slv-error-border: #ff8389;
+  --slv-critical-bg: #2d0709;
+  --slv-critical-color: #750E13;
+  --slv-critical-text: #ffffff;
+  --slv-critical-border: #750E13;
+
+  /* Accent &amp; Interactive */
+  --slv-accent: #0F62FE;
+  --slv-accent-hover: #0353e9;
+  --slv-accent-active: #002d9c;
+  --slv-focus-color: #0F62FE;
+  --slv-success: #198038;
+  --slv-shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+  --slv-shadow-md: 0 4px 12px rgba(0,0,0,0.1);
+  --slv-shadow-lg: 0 8px 24px rgba(0,0,0,0.15);
+  --slv-transition: all 0.2s ease-in-out;
+
+  position: relative;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--slv-text-primary);
+  background: var(--slv-bg-secondary);
+  border-radius: var(--slv-border-radius-lg);
+  padding: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+/* ---- Header ---- */
+.syslog-viewer-widget .slv-header {
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+  color: var(--slv-text-inverse);
+  padding: 1.5rem 2rem;
+  border-bottom: 3px solid var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.syslog-viewer-widget .slv-title {
+  font-size: 1.625rem;
+  font-weight: 700;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.syslog-viewer-widget .slv-title i {
+  font-size: 1.375rem;
+  opacity: 0.85;
+}
+
+.syslog-viewer-widget .slv-subtitle {
+  display: block;
+  font-size: 0.875rem;
+  opacity: 0.75;
+  margin-top: 0.25rem;
+}
+
+.syslog-viewer-widget .slv-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.syslog-viewer-widget .slv-refresh-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+}
+
+.syslog-viewer-widget .slv-last-updated {
+  font-size: 0.8125rem;
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+/* ---- Buttons ---- */
+.syslog-viewer-widget .slv-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border: 1px solid transparent;
+  border-radius: var(--slv-border-radius);
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.4;
+  padding: 0.5rem 1rem;
+  transition: var(--slv-transition);
+  text-decoration: none;
+  white-space: nowrap;
+  min-height: 2.75rem;
+  min-width: 2.75rem;
+}
+
+.syslog-viewer-widget .slv-btn:focus {
+  outline: 2px solid var(--slv-focus-color);
+  outline-offset: 2px;
+}
+
+.syslog-viewer-widget .slv-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.syslog-viewer-widget .slv-btn-primary {
+  background: var(--slv-accent);
+  color: var(--slv-text-inverse);
+  border-color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-btn-primary:hover:not(:disabled) {
+  background: var(--slv-accent-hover);
+  box-shadow: var(--slv-shadow-sm);
+  transform: translateY(-1px);
+}
+
+.syslog-viewer-widget .slv-btn-primary:active:not(:disabled) {
+  background: var(--slv-accent-active);
+  transform: translateY(0);
+}
+
+.syslog-viewer-widget .slv-btn-secondary {
+  background: var(--slv-bg-primary);
+  color: var(--slv-text-primary);
+  border-color: var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-btn-secondary:hover:not(:disabled) {
+  background: var(--slv-bg-tertiary);
+  border-color: var(--slv-text-muted);
+}
+
+.syslog-viewer-widget .slv-btn-outline {
+  background: transparent;
+  color: var(--slv-accent);
+  border-color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-btn-outline:hover:not(:disabled) {
+  background: var(--slv-info-bg);
+}
+
+.syslog-viewer-widget .slv-btn-icon {
+  padding: 0.5rem;
+  border-radius: 50%;
+}
+
+.syslog-viewer-widget .slv-btn-refresh {
+  background: rgba(255,255,255,0.15);
+  color: var(--slv-text-inverse);
+  border-color: rgba(255,255,255,0.3);
+}
+
+.syslog-viewer-widget .slv-btn-refresh:hover:not(:disabled) {
+  background: rgba(255,255,255,0.25);
+}
+
+.syslog-viewer-widget .slv-btn-link {
+  background: none;
+  border: none;
+  color: var(--slv-accent);
+  padding: 0.625rem 1.25rem;
+  font-size: 0.8125rem;
+  width: 100%;
+}
+
+.syslog-viewer-widget .slv-btn-link:hover {
+  background: var(--slv-bg-tertiary);
+}
+
+.syslog-viewer-widget .slv-btn-sm {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.8125rem;
+  min-height: 2.25rem;
+}
+
+.syslog-viewer-widget .slv-btn-action {
+  background: transparent;
+  color: var(--slv-text-secondary);
+  padding: 0.375rem;
+  border-radius: var(--slv-border-radius);
+  min-height: 2.25rem;
+  min-width: 2.25rem;
+}
+
+.syslog-viewer-widget .slv-btn-action:hover {
+  background: var(--slv-bg-tertiary);
+  color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-btn-action.slv-acknowledged {
+  color: var(--slv-success);
+}
+
+.syslog-viewer-widget .slv-btn-toast-close {
+  background: transparent;
+  color: inherit;
+  padding: 0.25rem;
+  min-height: auto;
+  min-width: auto;
+  opacity: 0.7;
+}
+
+.syslog-viewer-widget .slv-btn-toast-close:hover {
+  opacity: 1;
+}
+
+.syslog-viewer-widget .slv-btn-clear-search {
+  position: absolute;
+  right: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--slv-text-muted);
+  padding: 0.25rem;
+  min-height: auto;
+  min-width: auto;
+}
+
+/* ---- Select &amp; Input ---- */
+.syslog-viewer-widget .slv-select,
+.syslog-viewer-widget .slv-input {
+  border: 1px solid var(--slv-border-color);
+  border-radius: var(--slv-border-radius);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  background: var(--slv-bg-primary);
+  color: var(--slv-text-primary);
+  transition: var(--slv-transition);
+  min-height: 2.75rem;
+}
+
+.syslog-viewer-widget .slv-select:focus,
+.syslog-viewer-widget .slv-input:focus {
+  outline: 2px solid var(--slv-focus-color);
+  outline-offset: 1px;
+  border-color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-select-sm {
+  padding: 0.375rem 0.5rem;
+  font-size: 0.8125rem;
+  min-height: 2.25rem;
+}
+
+.syslog-viewer-widget .slv-input-search {
+  padding-left: 2.25rem;
+  padding-right: 2rem;
+  width: 100%;
+}
+
+.syslog-viewer-widget .slv-search-input-wrapper {
+  position: relative;
+  flex: 1;
+}
+
+.syslog-viewer-widget .slv-search-icon {
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--slv-text-muted);
+  pointer-events: none;
+}
+
+/* ---- Statistics Dashboard ---- */
+.syslog-viewer-widget .slv-stats-dashboard {
+  padding: 1.25rem 1.5rem;
+  background: var(--slv-bg-primary);
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-stats-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.syslog-viewer-widget .slv-stat-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem;
+  border-radius: var(--slv-border-radius-lg);
+  border-left: 4px solid transparent;
+  background: var(--slv-bg-secondary);
+  transition: var(--slv-transition);
+}
+
+.syslog-viewer-widget .slv-stat-card:hover {
+  box-shadow: var(--slv-shadow-md);
+  transform: translateY(-2px);
+}
+
+.syslog-viewer-widget .slv-stat-info { border-left-color: var(--slv-info-color); }
+.syslog-viewer-widget .slv-stat-warning { border-left-color: var(--slv-warning-border); }
+.syslog-viewer-widget .slv-stat-error { border-left-color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-stat-critical { border-left-color: var(--slv-critical-color); }
+.syslog-viewer-widget .slv-stat-total { border-left-color: var(--slv-accent); }
+
+.syslog-viewer-widget .slv-stat-icon {
+  font-size: 1.5rem;
+  opacity: 0.7;
+}
+.syslog-viewer-widget .slv-stat-info .slv-stat-icon { color: var(--slv-info-color); }
+.syslog-viewer-widget .slv-stat-warning .slv-stat-icon { color: var(--slv-warning-border); }
+.syslog-viewer-widget .slv-stat-error .slv-stat-icon { color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-stat-critical .slv-stat-icon { color: var(--slv-critical-color); }
+.syslog-viewer-widget .slv-stat-total .slv-stat-icon { color: var(--slv-accent); }
+
+.syslog-viewer-widget .slv-stat-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.syslog-viewer-widget .slv-stat-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--slv-text-primary);
+}
+
+.syslog-viewer-widget .slv-stat-label {
+  font-size: 0.75rem;
+  color: var(--slv-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.syslog-viewer-widget .slv-trend-up { color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-trend-down { color: var(--slv-success); }
+
+/* ---- Trend Chart ---- */
+.syslog-viewer-widget .slv-trend-chart-container {
+  margin-top: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-section-title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem;
+  color: var(--slv-text-primary);
+}
+
+.syslog-viewer-widget .slv-chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 120px;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-chart-bar-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+  justify-content: flex-end;
+}
+
+.syslog-viewer-widget .slv-chart-bar {
+  width: 100%;
+  max-width: 28px;
+  background: var(--slv-accent);
+  border-radius: 3px 3px 0 0;
+  position: relative;
+  min-height: 2px;
+  transition: height 0.4s ease;
+}
+
+.syslog-viewer-widget .slv-chart-bar-spike {
+  background: var(--slv-error-color);
+}
+
+.syslog-viewer-widget .slv-chart-bar-value {
+  position: absolute;
+  top: -1.25rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.625rem;
+  color: var(--slv-text-secondary);
+  white-space: nowrap;
+}
+
+.syslog-viewer-widget .slv-chart-bar-label {
+  font-size: 0.5625rem;
+  color: var(--slv-text-muted);
+  margin-top: 0.25rem;
+  text-align: center;
+}
+
+.syslog-viewer-widget .slv-chart-legend {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+}
+
+.syslog-viewer-widget .slv-chart-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--slv-text-secondary);
+}
+
+.syslog-viewer-widget .slv-legend-color {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.syslog-viewer-widget .slv-legend-normal { background: var(--slv-accent); }
+.syslog-viewer-widget .slv-legend-spike { background: var(--slv-error-color); }
+
+/* ---- Toggle Stats Button ---- */
+.syslog-viewer-widget .slv-toggle-stats {
+  border-bottom: 1px solid var(--slv-border-color);
+  border-radius: 0;
+}
+
+/* ---- Filter Section ---- */
+.syslog-viewer-widget .slv-filter-section {
+  background: var(--slv-bg-primary);
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-filter-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.875rem 1.5rem;
+  cursor: pointer;
+  user-select: none;
+  transition: var(--slv-transition);
+}
+
+.syslog-viewer-widget .slv-filter-header:hover {
+  background: var(--slv-bg-secondary);
+}
+
+.syslog-viewer-widget .slv-filter-header:focus {
+  outline: 2px solid var(--slv-focus-color);
+  outline-offset: -2px;
+}
+
+.syslog-viewer-widget .slv-filter-header .slv-section-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-active-filters-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--slv-accent);
+  color: var(--slv-text-inverse);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  width: 1.375rem;
+  height: 1.375rem;
+  border-radius: 50%;
+}
+
+.syslog-viewer-widget .slv-filter-body {
+  padding: 0 1.5rem 1.25rem;
+  animation: slvSlideDown 0.2s ease;
+}
+
+.syslog-viewer-widget .slv-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.syslog-viewer-widget .slv-filter-group {
+  flex: 1;
+  min-width: 180px;
+}
+
+.syslog-viewer-widget .slv-filter-group-search {
+  flex: 2;
+  min-width: 300px;
+}
+
+.syslog-viewer-widget .slv-filter-label {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--slv-text-secondary);
+  margin-bottom: 0.375rem;
+}
+
+.syslog-viewer-widget .slv-filter-group .slv-select,
+.syslog-viewer-widget .slv-filter-group .slv-input {
+  width: 100%;
+}
+
+.syslog-viewer-widget .slv-checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.syslog-viewer-widget .slv-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: var(--slv-border-radius);
+  border: 1px solid var(--slv-border-color);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  transition: var(--slv-transition);
+  min-height: 2.25rem;
+}
+
+.syslog-viewer-widget .slv-checkbox-label:hover {
+  border-color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-checkbox-label input:checked + .slv-checkbox-text {
+  font-weight: 600;
+}
+
+.syslog-viewer-widget .slv-severity-info-check input:checked ~ .slv-checkbox-text { color: var(--slv-info-color); }
+.syslog-viewer-widget .slv-severity-warning-check input:checked ~ .slv-checkbox-text { color: var(--slv-warning-color); }
+.syslog-viewer-widget .slv-severity-error-check input:checked ~ .slv-checkbox-text { color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-severity-critical-check input:checked ~ .slv-checkbox-text { color: var(--slv-critical-color); }
+
+.syslog-viewer-widget .slv-filter-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--slv-border-color);
+}
+
+/* ---- Toolbar ---- */
+.syslog-viewer-widget .slv-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--slv-bg-primary);
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-toolbar-left {
+  display: flex;
+  align-items: center;
+}
+
+.syslog-viewer-widget .slv-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.syslog-viewer-widget .slv-record-count {
+  font-size: 0.8125rem;
+  color: var(--slv-text-secondary);
+  font-weight: 500;
+}
+
+.syslog-viewer-widget .slv-export-group {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-page-size {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.syslog-viewer-widget .slv-page-size-label {
+  font-size: 0.8125rem;
+  color: var(--slv-text-secondary);
+  white-space: nowrap;
+}
+
+/* ---- Loading Overlay ---- */
+.syslog-viewer-widget .slv-loading-overlay {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1rem;
+  background: var(--slv-bg-primary);
+}
+
+.syslog-viewer-widget .slv-spinner {
+  display: flex;
+  gap: 0.375rem;
+}
+
+.syslog-viewer-widget .slv-spinner-bounce {
+  width: 12px;
+  height: 12px;
+  background: var(--slv-accent);
+  border-radius: 50%;
+  animation: slvBounce 1.4s ease-in-out infinite both;
+}
+
+.syslog-viewer-widget .slv-bounce1 { animation-delay: -0.32s; }
+.syslog-viewer-widget .slv-bounce2 { animation-delay: -0.16s; }
+.syslog-viewer-widget .slv-bounce3 { animation-delay: 0s; }
+
+@keyframes slvBounce {
+  0%, 80%, 100% { transform: scale(0); }
+  40% { transform: scale(1); }
+}
+
+@keyframes slvSlideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.syslog-viewer-widget .slv-loading-text {
+  margin-top: 0.75rem;
+  font-size: 0.875rem;
+  color: var(--slv-text-secondary);
+}
+
+/* ---- Empty State ---- */
+.syslog-viewer-widget .slv-empty-state {
+  text-align: center;
+  padding: 3rem 2rem;
+  background: var(--slv-bg-primary);
+}
+
+.syslog-viewer-widget .slv-empty-icon {
+  font-size: 3rem;
+  color: var(--slv-text-muted);
+  margin-bottom: 1rem;
+}
+
+.syslog-viewer-widget .slv-empty-state h3 {
+  font-size: 1.125rem;
+  color: var(--slv-text-primary);
+  margin-bottom: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-empty-state p {
+  color: var(--slv-text-secondary);
+  font-size: 0.875rem;
+  margin-bottom: 1.25rem;
+}
+
+/* ---- Log Table ---- */
+.syslog-viewer-widget .slv-log-table-wrapper {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.syslog-viewer-widget .slv-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--slv-bg-primary);
+}
+
+.syslog-viewer-widget .slv-log-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.syslog-viewer-widget .slv-log-table th {
+  background: var(--slv-bg-dark);
+  color: var(--slv-text-inverse);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.75rem 0.625rem;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 2px solid var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-log-table th:hover {
+  background: #252545;
+}
+
+.syslog-viewer-widget .slv-log-table th:focus {
+  outline: 2px solid var(--slv-focus-color);
+  outline-offset: -2px;
+}
+
+.syslog-viewer-widget .slv-th-severity { width: 40px; cursor: default; }
+.syslog-viewer-widget .slv-th-timestamp { min-width: 140px; }
+.syslog-viewer-widget .slv-th-source { min-width: 120px; }
+.syslog-viewer-widget .slv-th-level { min-width: 90px; }
+.syslog-viewer-widget .slv-th-message { min-width: 200px; }
+.syslog-viewer-widget .slv-th-table { min-width: 100px; }
+.syslog-viewer-widget .slv-th-actions { width: 110px; cursor: default; }
+
+.syslog-viewer-widget .slv-log-row {
+  cursor: pointer;
+  transition: background 0.15s ease;
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-log-row:hover {
+  background: var(--slv-bg-secondary);
+}
+
+.syslog-viewer-widget .slv-log-row:focus {
+  outline: 2px solid var(--slv-focus-color);
+  outline-offset: -2px;
+}
+
+.syslog-viewer-widget .slv-log-row td {
+  padding: 0.625rem;
+  vertical-align: top;
+  font-size: 0.8125rem;
+}
+
+/* Severity row coloring */
+.syslog-viewer-widget .slv-log-row.slv-row-info {
+  border-left: 3px solid var(--slv-info-color);
+}
+.syslog-viewer-widget .slv-log-row.slv-row-warning {
+  border-left: 3px solid var(--slv-warning-border);
+  background: rgba(241, 194, 27, 0.04);
+}
+.syslog-viewer-widget .slv-log-row.slv-row-error {
+  border-left: 3px solid var(--slv-error-color);
+  background: rgba(218, 30, 40, 0.04);
+}
+.syslog-viewer-widget .slv-log-row.slv-row-critical {
+  border-left: 3px solid var(--slv-critical-color);
+  background: rgba(117, 14, 19, 0.08);
+}
+
+.syslog-viewer-widget .slv-log-row.slv-row-warning:hover { background: rgba(241, 194, 27, 0.08); }
+.syslog-viewer-widget .slv-log-row.slv-row-error:hover { background: rgba(218, 30, 40, 0.08); }
+.syslog-viewer-widget .slv-log-row.slv-row-critical:hover { background: rgba(117, 14, 19, 0.12); }
+
+/* ---- Severity Badge ---- */
+.syslog-viewer-widget .slv-severity-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  font-size: 0.75rem;
+}
+
+.syslog-viewer-widget .slv-severity-info { background: var(--slv-info-bg); color: var(--slv-info-color); }
+.syslog-viewer-widget .slv-severity-warning { background: var(--slv-warning-bg); color: var(--slv-warning-color); }
+.syslog-viewer-widget .slv-severity-error { background: var(--slv-error-bg); color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-severity-critical { background: var(--slv-critical-bg); color: var(--slv-critical-text); }
+
+/* ---- Level Labels ---- */
+.syslog-viewer-widget .slv-level-label {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 3px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.syslog-viewer-widget .slv-level-info { background: var(--slv-info-bg); color: var(--slv-info-color); }
+.syslog-viewer-widget .slv-level-warning { background: var(--slv-warning-bg); color: var(--slv-warning-text); }
+.syslog-viewer-widget .slv-level-error { background: var(--slv-error-bg); color: var(--slv-error-color); }
+.syslog-viewer-widget .slv-level-critical { background: var(--slv-critical-color); color: var(--slv-critical-text); }
+
+/* ---- Timestamp ---- */
+.syslog-viewer-widget .slv-timestamp {
+  display: block;
+  font-size: 0.8125rem;
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+}
+
+.syslog-viewer-widget .slv-time-ago {
+  display: block;
+  font-size: 0.6875rem;
+  color: var(--slv-text-muted);
+  margin-top: 0.125rem;
+}
+
+/* ---- Source &amp; Table Tags ---- */
+.syslog-viewer-widget .slv-source-tag {
+  display: inline-block;
+  font-weight: 600;
+  font-size: 0.8125rem;
+  color: var(--slv-text-primary);
+}
+
+.syslog-viewer-widget .slv-log-table-name {
+  display: block;
+  font-size: 0.6875rem;
+  color: var(--slv-text-muted);
+  font-style: italic;
+}
+
+.syslog-viewer-widget .slv-table-badge,
+.syslog-viewer-widget .slv-type-badge {
+  display: inline-block;
+  padding: 0.125rem 0.375rem;
+  background: var(--slv-bg-tertiary);
+  border-radius: 3px;
+  font-size: 0.6875rem;
+  color: var(--slv-text-secondary);
+}
+
+/* ---- Message ---- */
+.syslog-viewer-widget .slv-message-text {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.syslog-viewer-widget .slv-message-text .slv-keyword-highlight {
+  background: #FFEB3B;
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 600;
+}
+
+/* ---- Action Buttons ---- */
+.syslog-viewer-widget .slv-action-buttons {
+  display: flex;
+  gap: 0.25rem;
+}
+
+/* ---- Detail Row ---- */
+.syslog-viewer-widget .slv-detail-row {
+  border-bottom: 2px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-detail-row.slv-row-info { border-left: 3px solid var(--slv-info-color); }
+.syslog-viewer-widget .slv-detail-row.slv-row-warning { border-left: 3px solid var(--slv-warning-border); }
+.syslog-viewer-widget .slv-detail-row.slv-row-error { border-left: 3px solid var(--slv-error-color); }
+.syslog-viewer-widget .slv-detail-row.slv-row-critical { border-left: 3px solid var(--slv-critical-color); }
+
+.syslog-viewer-widget .slv-detail-cell {
+  padding: 0 !important;
+}
+
+.syslog-viewer-widget .slv-detail-content {
+  padding: 1.25rem 1.5rem;
+  background: var(--slv-bg-secondary);
+  animation: slvSlideDown 0.25s ease;
+}
+
+.syslog-viewer-widget .slv-detail-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.syslog-viewer-widget .slv-detail-section-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--slv-text-secondary);
+  margin: 0 0 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.syslog-viewer-widget .slv-detail-message,
+.syslog-viewer-widget .slv-detail-stacktrace {
+  background: var(--slv-bg-dark);
+  color: #e0e0e0;
+  padding: 1rem;
+  border-radius: var(--slv-border-radius);
+  font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+.syslog-viewer-widget .slv-metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-metadata-item {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  padding: 0.375rem 0.5rem;
+  background: var(--slv-bg-primary);
+  border-radius: var(--slv-border-radius);
+}
+
+.syslog-viewer-widget .slv-metadata-key {
+  font-weight: 600;
+  color: var(--slv-text-secondary);
+  white-space: nowrap;
+}
+
+.syslog-viewer-widget .slv-metadata-value {
+  color: var(--slv-text-primary);
+  word-break: break-all;
+  font-family: 'SFMono-Regular', 'Consolas', monospace;
+  font-size: 0.75rem;
+}
+
+.syslog-viewer-widget .slv-related-records {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.syslog-viewer-widget .slv-related-record {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+}
+
+.syslog-viewer-widget .slv-related-link {
+  color: var(--slv-accent);
+  text-decoration: none;
+}
+
+.syslog-viewer-widget .slv-related-link:hover {
+  text-decoration: underline;
+}
+
+.syslog-viewer-widget .slv-transaction-logs {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--slv-border-color);
+  border-radius: var(--slv-border-radius);
+}
+
+.syslog-viewer-widget .slv-mini-log-entry {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.375rem 0.625rem;
+  font-size: 0.75rem;
+  border-bottom: 1px solid var(--slv-border-color);
+}
+
+.syslog-viewer-widget .slv-mini-log-entry:last-child { border-bottom: none; }
+.syslog-viewer-widget .slv-mini-info { background: var(--slv-info-bg); }
+.syslog-viewer-widget .slv-mini-warning { background: var(--slv-warning-bg); }
+.syslog-viewer-widget .slv-mini-error { background: var(--slv-error-bg); }
+.syslog-viewer-widget .slv-mini-critical { background: var(--slv-critical-bg); color: var(--slv-critical-text); }
+
+.syslog-viewer-widget .slv-mini-time {
+  font-family: monospace;
+  white-space: nowrap;
+  color: var(--slv-text-muted);
+}
+
+.syslog-viewer-widget .slv-mini-level {
+  font-weight: 600;
+  white-space: nowrap;
+  min-width: 60px;
+}
+
+.syslog-viewer-widget .slv-mini-message {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.syslog-viewer-widget .slv-detail-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--slv-border-color);
+  flex-wrap: wrap;
+}
+
+/* ---- Pagination ---- */
+.syslog-viewer-widget .slv-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.875rem 1.5rem;
+  background: var(--slv-bg-primary);
+  border-top: 1px solid var(--slv-border-color);
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.syslog-viewer-widget .slv-pagination-info {
+  font-size: 0.8125rem;
+  color: var(--slv-text-secondary);
+}
+
+.syslog-viewer-widget .slv-pagination-controls {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.syslog-viewer-widget .slv-btn-page {
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  padding: 0.375rem 0.625rem;
+  background: var(--slv-bg-primary);
+  border: 1px solid var(--slv-border-color);
+  color: var(--slv-text-primary);
+  font-size: 0.8125rem;
+  border-radius: var(--slv-border-radius);
+}
+
+.syslog-viewer-widget .slv-btn-page:hover:not(:disabled) {
+  background: var(--slv-bg-tertiary);
+  border-color: var(--slv-accent);
+}
+
+.syslog-viewer-widget .slv-btn-page-active {
+  background: var(--slv-accent) !important;
+  color: var(--slv-text-inverse) !important;
+  border-color: var(--slv-accent) !important;
+  font-weight: 600;
+}
+
+/* ---- Toast ---- */
+.syslog-viewer-widget .slv-toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.875rem 1.25rem;
+  border-radius: var(--slv-border-radius);
+  box-shadow: var(--slv-shadow-lg);
+  font-size: 0.875rem;
+  font-weight: 500;
+  animation: slvSlideIn 0.3s ease;
+  max-width: 420px;
+}
+
+.syslog-viewer-widget .slv-toast-success { background: #198038; color: #fff; }
+.syslog-viewer-widget .slv-toast-error { background: var(--slv-error-color); color: #fff; }
+.syslog-viewer-widget .slv-toast-info { background: var(--slv-accent); color: #fff; }
+.syslog-viewer-widget .slv-toast-warning { background: var(--slv-warning-border); color: #000; }
+
+@keyframes slvSlideIn {
+  from { opacity: 0; transform: translateX(60px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* ---- Screen reader only ---- */
+.syslog-viewer-widget .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* ---- Reduced Motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  .syslog-viewer-widget .slv-spinner-bounce,
+  .syslog-viewer-widget .slv-chart-bar,
+  .syslog-viewer-widget .slv-toast,
+  .syslog-viewer-widget .slv-filter-body,
+  .syslog-viewer-widget .slv-detail-content {
+    animation: none !important;
+    transition: none !important;
+  }
+  .syslog-viewer-widget .slv-btn,
+  .syslog-viewer-widget .slv-stat-card,
+  .syslog-viewer-widget .slv-log-row {
+    transition: none !important;
+  }
+}
+
+/* ---- Responsive Breakpoints ---- */
+@media screen and (max-width: 1200px) {
+  .syslog-viewer-widget .slv-stats-row {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media screen and (max-width: 992px) {
+  .syslog-viewer-widget .slv-stats-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .syslog-viewer-widget .slv-header-content {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .syslog-viewer-widget .slv-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .syslog-viewer-widget .slv-th-table {
+    display: none;
+  }
+  .syslog-viewer-widget .slv-td-table {
+    display: none;
+  }
+}
+
+@media screen and (max-width: 768px) {
+  .syslog-viewer-widget .slv-header {
+    padding: 1rem 1rem;
+  }
+  .syslog-viewer-widget .slv-title {
+    font-size: 1.25rem;
+  }
+  .syslog-viewer-widget .slv-stats-row {
+    grid-template-columns: 1fr;
+  }
+  .syslog-viewer-widget .slv-filter-body {
+    padding: 0 1rem 1rem;
+  }
+  .syslog-viewer-widget .slv-filter-row {
+    flex-direction: column;
+  }
+  .syslog-viewer-widget .slv-filter-group {
+    min-width: 100%;
+  }
+  .syslog-viewer-widget .slv-toolbar {
+    padding: 0.625rem 1rem;
+  }
+  .syslog-viewer-widget .slv-export-group {
+    width: 100%;
+  }
+  .syslog-viewer-widget .slv-export-group .slv-btn {
+    flex: 1;
+  }
+  .syslog-viewer-widget .slv-pagination {
+    flex-direction: column;
+    align-items: center;
+  }
+  .syslog-viewer-widget .slv-metadata-grid {
+    grid-template-columns: 1fr;
+  }
+  .syslog-viewer-widget .slv-detail-content {
+    padding: 1rem;
+  }
+  .syslog-viewer-widget .slv-th-source,
+  .syslog-viewer-widget .slv-td-source {
+    display: none;
+  }
+  .syslog-viewer-widget .slv-log-row td {
+    padding: 0.5rem 0.375rem;
+  }
+}
+
+@media screen and (max-width: 480px) {
+  .syslog-viewer-widget .slv-th-level,
+  .syslog-viewer-widget .slv-td-level {
+    display: none;
+  }
+  .syslog-viewer-widget .slv-refresh-controls {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .syslog-viewer-widget .slv-pagination-controls {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .syslog-viewer-widget .slv-toast {
+    left: 0.5rem;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    max-width: none;
+  }
+}</css>
+<data_table>sp_instance</data_table>
+<demo_data/>
+<description>SYSTEM LOG VIEWER WIDGET REQUIREMENTS SPECIFICATION
+
+WIDGET NAME
+System Log Viewer Portal Widget
+
+PURPOSE
+Provide system administrators with a centralized, real-time dashboard to monitor, filter, and </description>
+<docs display_value=""/>
+<field_list/>
+<has_preview>false</has_preview>
+<id>system_log_viewer_widget_requir_c3974784</id>
+<internal>false</internal>
+<link><![CDATA[function link(scope, element, attrs, controller) {  }]]></link>
+<name>SYSTEM LOG VIEWER WIDGET REQUIREMENTS SP</name>
+<option_schema/>
+<public>true</public>
+<roles/>
+<script><![CDATA[(function() {
+  // ========================================
+  // System Log Viewer - Server Script
+  // ========================================
+
+  var SENSITIVE_PATTERNS = [
+    /password\s*[:=]\s*\S+/gi,
+    /token\s*[:=]\s*\S+/gi,
+    /api[_-]?key\s*[:=]\s*\S+/gi,
+    /secret\s*[:=]\s*\S+/gi,
+    /authorization\s*[:=]\s*bearer\s+\S+/gi,
+    /ssn\s*[:=]\s*\d{3}-?\d{2}-?\d{4}/gi,
+    /\b\d{3}-\d{2}-\d{4}\b/g
+  ];
+
+  /**
+   * Sanitize log message content to prevent PII/credential disclosure
+   */
+  function sanitizeMessage(message) {
+    if (!message) return '';
+    var sanitized = message;
+    for (var i = 0; i < SENSITIVE_PATTERNS.length; i++) {
+      sanitized = sanitized.replace(SENSITIVE_PATTERNS[i], '[REDACTED]');
+    }
+    return sanitized;
+  }
+
+  /**
+   * Check if current user has required admin/log viewer roles
+   */
+  function checkAccess() {
+    var gr = gs.getUser();
+    return gr.hasRole('admin') || gr.hasRole('itil') || gr.hasRole('sn_admin') ||
+           gr.hasRole('system_log_viewer') || gr.hasRole('security_admin');
+  }
+
+  /**
+   * Build time range encoded query fragment
+   */
+  function getTimeRangeQuery(timeRange, dateFrom, dateTo) {
+    var now = new GlideDateTime();
+    var start = new GlideDateTime();
+
+    switch (timeRange) {
+      case '1h':
+        start.addSeconds(-3600);
+        break;
+      case '4h':
+        start.addSeconds(-14400);
+        break;
+      case '24h':
+        start.addSeconds(-86400);
+        break;
+      case '7d':
+        start.addSeconds(-604800);
+        break;
+      case '30d':
+        start.addSeconds(-2592000);
+        break;
+      case 'custom':
+        if (dateFrom) {
+          return 'sys_created_on>=' + dateFrom + (dateTo ? '^sys_created_on<=' + dateTo : '');
+        }
+        start.addSeconds(-86400);
+        break;
+      default:
+        start.addSeconds(-86400);
+    }
+    return 'sys_created_on>=' + start.getDisplayValue();
+  }
+
+  /**
+   * Build severity filter for syslog table
+   * syslog levels: 0=Emergency, 1=Alert, 2=Critical, 3=Error, 4=Warning, 5=Notice, 6=Info, 7=Debug
+   */
+  function getSeverityLevels(severityFilter) {
+    var levels = [];
+    if (severityFilter.critical) {
+      levels.push('0');
+      levels.push('1');
+      levels.push('2');
+    }
+    if (severityFilter.error) {
+      levels.push('3');
+    }
+    if (severityFilter.warning) {
+      levels.push('4');
+      levels.push('5');
+    }
+    if (severityFilter.info) {
+      levels.push('6');
+      levels.push('7');
+    }
+    return levels;
+  }
+
+  /**
+   * Map syslog numeric level to normalized severity
+   */
+  function mapLevelToSeverity(level) {
+    var num = parseInt(level, 10);
+    if (isNaN(num)) {
+      var l = String(level).toLowerCase();
+      if (l === 'error' || l === 'err') return 'error';
+      if (l === 'warning' || l === 'warn') return 'warning';
+      if (l === 'critical' || l === 'fatal') return 'critical';
+      return 'info';
+    }
+    if (num <= 2) return 'critical';
+    if (num === 3) return 'error';
+    if (num <= 5) return 'warning';
+    return 'info';
+  }
+
+  /**
+   * Fetch log entries with pagination, filtering, and sorting
+   */
+  function fetchLogEntries(filters, pagination, sort) {
+    var logEntries = [];
+    var totalRecords = 0;
+    var pageSize = parseInt(pagination.pageSize, 10) || 50;
+    var currentPage = parseInt(pagination.currentPage, 10) || 1;
+    var offset = (currentPage - 1) * pageSize;
+    var sortField = sort.field || 'sys_created_on';
+    var sortDir = sort.direction || 'desc';
+
+    var logSource = filters.logSource || '';
+    var tablesToQuery = [];
+
+    if (!logSource || logSource === 'syslog') tablesToQuery.push('syslog');
+    if (!logSource || logSource === 'sys_log') tablesToQuery.push('sys_log');
+    if (!logSource || logSource === 'sys_email_log') tablesToQuery.push('sys_email_log');
+    if (!logSource || logSource === 'sysevent') tablesToQuery.push('sysevent');
+
+    // If a specific source, query just that one
+    if (logSource) {
+      tablesToQuery = [logSource];
+    }
+
+    var timeRangeQuery = getTimeRangeQuery(
+      filters.timeRange || '24h',
+      filters.dateFrom || null,
+      filters.dateTo || null
+    );
+
+    var severityLevels = getSeverityLevels(filters.severity || {
+      info: true, warning: true, error: true, critical: true
+    });
+
+    // Primary query: syslog table as main data source
+    // For unified view, query syslog primarily then supplement
+    var primaryTable = logSource || 'syslog';
+
+    // Count total records first using GlideAggregate
+    var ga = new GlideAggregate(primaryTable);
+    ga.addAggregate('COUNT');
+
+    // Apply time range
+    if (timeRangeQuery) {
+      ga.addEncodedQuery(timeRangeQuery);
+    }
+
+    // Apply severity filter (for syslog which has numeric levels)
+    if (primaryTable === 'syslog' && severityLevels.length > 0 && severityLevels.length < 8) {
+      ga.addEncodedQuery('levelIN' + severityLevels.join(','));
+    }
+
+    // Apply source app filter
+    if (filters.sourceApp) {
+      ga.addQuery('source', 'CONTAINS', filters.sourceApp);
+    }
+
+    // Apply keyword search
+    if (filters.keyword) {
+      ga.addEncodedQuery('messageLIKE' + filters.keyword);
+    }
+
+    ga.query();
+    if (ga.next()) {
+      totalRecords = parseInt(ga.getAggregate('COUNT'), 10);
+    }
+
+    // Now fetch actual records
+    var gr = new GlideRecord(primaryTable);
+
+    // Build encoded query
+    var queryParts = [];
+    if (timeRangeQuery) queryParts.push(timeRangeQuery);
+
+    if (primaryTable === 'syslog' && severityLevels.length > 0 && severityLevels.length < 8) {
+      queryParts.push('levelIN' + severityLevels.join(','));
+    }
+
+    if (filters.sourceApp) {
+      queryParts.push('sourceLIKE' + filters.sourceApp);
+    }
+
+    if (filters.keyword) {
+      queryParts.push('messageLIKE' + filters.keyword);
+    }
+
+    if (queryParts.length > 0) {
+      gr.addEncodedQuery(queryParts.join('^'));
+    }
+
+    // Apply sorting
+    if (sortDir === 'desc') {
+      gr.orderByDesc(sortField);
+    } else {
+      gr.orderBy(sortField);
+    }
+
+    // Pagination
+    gr.chooseWindow(offset, offset + pageSize);
+    gr.setLimit(pageSize);
+    gr.query();
+
+    while (gr.next()) {
+      var entry = {
+        sys_id: gr.getUniqueValue(),
+        sys_created_on: gr.getValue('sys_created_on') || '',
+        source: gr.getValue('source') || '',
+        message: sanitizeMessage(gr.getValue('message') || ''),
+        level: gr.getValue('level') || '',
+        sys_created_by: gr.getValue('sys_created_by') || '',
+        logTable: primaryTable,
+        expanded: false,
+        acknowledged: false
+      };
+
+      // Table-specific fields
+      if (primaryTable === 'syslog') {
+        entry.transaction_id = gr.getValue('transaction_id') || '';
+        entry.elapsed_time = gr.getValue('elapsed_time') || '';
+      } else if (primaryTable === 'sys_log') {
+        entry.type = gr.getValue('type') || '';
+        entry.method = gr.getValue('method') || '';
+        entry.stack_trace = sanitizeMessage(gr.getValue('stack_trace') || '');
+        entry.transaction_id = '';
+      } else if (primaryTable === 'sys_email_log') {
+        entry.type = gr.getValue('type') || '';
+        entry.message = sanitizeMessage(
+          (gr.getValue('subject') || '') + ' - ' +
+          (gr.getValue('error_string') || gr.getValue('type') || '')
+        );
+        entry.source = 'Email: ' + (gr.getValue('recipients') || '');
+        entry.transaction_id = '';
+      } else if (primaryTable === 'sysevent') {
+        entry.source = gr.getValue('name') || '';
+        entry.message = sanitizeMessage(
+          'Event: ' + (gr.getValue('name') || '') + ' | State: ' + (gr.getValue('state') || '') +
+          ' | Table: ' + (gr.getValue('table') || '') +
+          (gr.getValue('error_condition') ? ' | Error: ' + gr.getValue('error_condition') : '')
+        );
+        entry.table_name = gr.getValue('table') || '';
+        entry.level = gr.getValue('state') === 'error' ? '3' : '6';
+        entry.transaction_id = '';
+      }
+
+      logEntries.push(entry);
+    }
+
+    return {
+      logEntries: logEntries,
+      totalRecords: totalRecords
+    };
+  }
+
+  /**
+   * Fetch statistics using GlideAggregate
+   */
+  function fetchStatistics(filters) {
+    var stats = { info: 0, warning: 0, error: 0, critical: 0, total: 0 };
+
+    // Count by severity for last 24 hours
+    var ga = new GlideAggregate('syslog');
+    ga.addAggregate('COUNT');
+    ga.groupBy('level');
+    var oneDayAgo = new GlideDateTime();
+    oneDayAgo.addSeconds(-86400);
+    ga.addQuery('sys_created_on', '>=', oneDayAgo);
+    ga.query();
+
+    while (ga.next()) {
+      var level = ga.getValue('level');
+      var count = parseInt(ga.getAggregate('COUNT'), 10);
+      var severity = mapLevelToSeverity(level);
+
+      stats[severity] = (stats[severity] || 0) + count;
+      stats.total += count;
+    }
+
+    return stats;
+  }
+
+  /**
+   * Fetch hourly trend data for the last 24 hours with spike detection
+   */
+  function fetchTrendData() {
+    var trendData = [];
+    var hourlyCounts = [];
+    var now = new GlideDateTime();
+
+    // Get counts for each of the past 24 hours
+    for (var h = 23; h >= 0; h--) {
+      var hourStart = new GlideDateTime();
+      hourStart.addSeconds(-((h + 1) * 3600));
+      var hourEnd = new GlideDateTime();
+      hourEnd.addSeconds(-(h * 3600));
+
+      var ga = new GlideAggregate('syslog');
+      ga.addAggregate('COUNT');
+      ga.addQuery('sys_created_on', '>=', hourStart);
+      ga.addQuery('sys_created_on', '<', hourEnd);
+      ga.query();
+
+      var count = 0;
+      if (ga.next()) {
+        count = parseInt(ga.getAggregate('COUNT'), 10) || 0;
+      }
+
+      var hourLabel = new GlideDateTime(hourStart);
+      var displayHour = hourLabel.getDisplayValue().substring(11, 16);
+
+      hourlyCounts.push(count);
+      trendData.push({
+        label: hourLabel.getDisplayValue(),
+        shortLabel: displayHour,
+        count: count,
+        isSpike: false
+      });
+    }
+
+    // Spike detection: identify counts > 2 standard deviations from mean
+    if (hourlyCounts.length > 0) {
+      var sum = 0;
+      for (var i = 0; i < hourlyCounts.length; i++) {
+        sum += hourlyCounts[i];
+      }
+      var mean = sum / hourlyCounts.length;
+
+      var varianceSum = 0;
+      for (var j = 0; j < hourlyCounts.length; j++) {
+        varianceSum += Math.pow(hourlyCounts[j] - mean, 2);
+      }
+      var stdDev = Math.sqrt(varianceSum / hourlyCounts.length);
+
+      var threshold = mean + (2 * stdDev);
+      for (var k = 0; k < trendData.length; k++) {
+        if (trendData[k].count > threshold && stdDev > 0) {
+          trendData[k].isSpike = true;
+        }
+      }
+    }
+
+    return trendData;
+  }
+
+  /**
+   * Fetch available source names for filter dropdown
+   */
+  function fetchSourcesAvailable() {
+    var sources = [];
+    var ga = new GlideAggregate('syslog');
+    ga.addAggregate('COUNT');
+    ga.groupBy('source');
+    var oneDayAgo = new GlideDateTime();
+    oneDayAgo.addSeconds(-86400);
+    ga.addQuery('sys_created_on', '>=', oneDayAgo);
+    ga.orderByAggregate('COUNT', 'DESC');
+    ga.setLimit(50);
+    ga.query();
+
+    while (ga.next()) {
+      var src = ga.getValue('source');
+      if (src) {
+        sources.push(src);
+      }
+    }
+    return sources;
+  }
+
+  /**
+   * Load transaction context: related log entries sharing same transaction_id
+   */
+  function loadTransactionContext(transactionId, currentSysId) {
+    var transactionLogs = [];
+    var relatedRecords = [];
+
+    if (!transactionId) {
+      return { transactionLogs: transactionLogs, relatedRecords: relatedRecords };
+    }
+
+    // Query sys_log for related transaction entries
+    var gr = new GlideRecord('sys_log');
+    gr.addQuery('sys_id', '!=', currentSysId);
+    gr.orderBy('sys_created_on');
+    gr.setLimit(50);
+    gr.query();
+
+    // Also check syslog for same transaction
+    var gr2 = new GlideRecord('syslog');
+    gr2.addQuery('transaction_id', transactionId);
+    gr2.addQuery('sys_id', '!=', currentSysId);
+    gr2.orderBy('sys_created_on');
+    gr2.setLimit(25);
+    gr2.query();
+
+    while (gr2.next()) {
+      transactionLogs.push({
+        sys_id: gr2.getUniqueValue(),
+        sys_created_on: gr2.getValue('sys_created_on'),
+        level: gr2.getValue('level'),
+        source: gr2.getValue('source'),
+        message: sanitizeMessage(gr2.getValue('message') || '').substring(0, 200)
+      });
+    }
+
+    return {
+      transactionLogs: transactionLogs,
+      relatedRecords: relatedRecords
+    };
+  }
+
+  /**
+   * Create incident from log entry
+   */
+  function createIncidentFromLog(params) {
+    var result = { incident_number: '' };
+
+    try {
+      var inc = new GlideRecord('incident');
+      inc.initialize();
+      inc.setValue('short_description', 'System Log Alert: ' +
+        (params.log_message || '').substring(0, 160));
+      inc.setValue('description',
+        'Auto-generated from System Log Viewer\n\n' +
+        'Log Source: ' + (params.log_source || 'syslog') + '\n' +
+        'Severity: ' + (params.log_level || 'Unknown') + '\n' +
+        'Log Time: ' + (params.log_created_on || '') + '\n' +
+        'Log Sys ID: ' + (params.log_sys_id || '') + '\n\n' +
+        'Message:\n' + (params.log_message || '')
+      );
+      inc.setValue('urgency', '2');
+      inc.setValue('impact', '2');
+      inc.setValue('category', 'software');
+      inc.setValue('subcategory', 'error');
+      inc.setValue('assignment_group', 'Service Desk');
+      inc.setValue('caller_id', gs.getUserID());
+
+      // Map severity to incident priority
+      var severity = mapLevelToSeverity(params.log_level || '6');
+      if (severity === 'critical') {
+        inc.setValue('urgency', '1');
+        inc.setValue('impact', '1');
+      } else if (severity === 'error') {
+        inc.setValue('urgency', '2');
+        inc.setValue('impact', '2');
+      }
+
+      var sysId = inc.insert();
+      if (sysId) {
+        var inserted = new GlideRecord('incident');
+        if (inserted.get(sysId)) {
+          result.incident_number = inserted.getValue('number');
+        }
+      }
+    } catch (e) {
+      gs.error('SLV: Error creating incident - ' + e.message);
+    }
+
+    return result;
+  }
+
+  /**
+   * Prepare export data in CSV or JSON format
+   */
+  function prepareExportData(format, filters, sort) {
+    var exportContent = '';
+    var gr = new GlideRecord('syslog');
+
+    // Build query
+    var queryParts = [];
+    var timeRangeQuery = getTimeRangeQuery(
+      filters.timeRange || '24h',
+      filters.dateFrom || null,
+      filters.dateTo || null
+    );
+    if (timeRangeQuery) queryParts.push(timeRangeQuery);
+
+    var severityLevels = getSeverityLevels(filters.severity || {
+      info: true, warning: true, error: true, critical: true
+    });
+    if (severityLevels.length > 0 && severityLevels.length < 8) {
+      queryParts.push('levelIN' + severityLevels.join(','));
+    }
+    if (filters.sourceApp) queryParts.push('sourceLIKE' + filters.sourceApp);
+    if (filters.keyword) queryParts.push('messageLIKE' + filters.keyword);
+
+    if (queryParts.length > 0) {
+      gr.addEncodedQuery(queryParts.join('^'));
+    }
+
+    var sortField = (sort && sort.field) ? sort.field : 'sys_created_on';
+    var sortDir = (sort && sort.direction) ? sort.direction : 'desc';
+    if (sortDir === 'desc') {
+      gr.orderByDesc(sortField);
+    } else {
+      gr.orderBy(sortField);
+    }
+
+    gr.setLimit(5000); // Cap export at 5000 records
+    gr.query();
+
+    if (format === 'csv') {
+      var csvRows = [];
+      csvRows.push('"Sys ID","Created On","Source","Level","Severity","Message","Created By","Transaction ID"');
+
+      while (gr.next()) {
+        var msg = sanitizeMessage(gr.getValue('message') || '');
+        msg = msg.replace(/"/g, '""'); // Escape quotes for CSV
+        var row = '"' + gr.getUniqueValue() + '",' +
+                  '"' + (gr.getValue('sys_created_on') || '') + '",' +
+                  '"' + (gr.getValue('source') || '').replace(/"/g, '""') + '",' +
+                  '"' + (gr.getValue('level') || '') + '",' +
+                  '"' + mapLevelToSeverity(gr.getValue('level') || '') + '",' +
+                  '"' + msg + '",' +
+                  '"' + (gr.getValue('sys_created_by') || '') + '",' +
+                  '"' + (gr.getValue('transaction_id') || '') + '"';
+        csvRows.push(row);
+      }
+      exportContent = csvRows.join('\n');
+    } else {
+      // JSON format
+      var jsonArray = [];
+      while (gr.next()) {
+        jsonArray.push({
+          sys_id: gr.getUniqueValue(),
+          sys_created_on: gr.getValue('sys_created_on') || '',
+          source: gr.getValue('source') || '',
+          level: gr.getValue('level') || '',
+          severity: mapLevelToSeverity(gr.getValue('level') || ''),
+          message: sanitizeMessage(gr.getValue('message') || ''),
+          sys_created_by: gr.getValue('sys_created_by') || '',
+          transaction_id: gr.getValue('transaction_id') || ''
+        });
+      }
+      exportContent = JSON.stringify(jsonArray, null, 2);
+    }
+
+    return exportContent;
+  }
+
+  // ========================================
+  // MAIN EXECUTION
+  // ========================================
+
+  // Access control check
+  if (!checkAccess()) {
+    data.error = 'Access Denied: You do not have the required role to view system logs.';
+    data.logEntries = [];
+    data.totalRecords = 0;
+    data.stats = {};
+    data.trendData = [];
+    data.sourcesAvailable = [];
+    return;
+  }
+
+  // Handle client-side actions via input parameters
+  if (input) {
+    var action = input.action || '';
+
+    if (action === 'fetch_logs') {
+      var filters = input.filters || {};
+      var pagination = input.pagination || { currentPage: 1, pageSize: 50 };
+      var sort = input.sort || { field: 'sys_created_on', direction: 'desc' };
+
+      var logResult = fetchLogEntries(filters, pagination, sort);
+      data.logEntries = logResult.logEntries;
+      data.totalRecords = logResult.totalRecords;
+      data.stats = fetchStatistics(filters);
+      data.trendData = fetchTrendData();
+      data.sourcesAvailable = fetchSourcesAvailable();
+      return;
+    }
+
+    if (action === 'load_transaction_context') {
+      var ctx = loadTransactionContext(
+        input.transaction_id || '',
+        input.current_sys_id || ''
+      );
+      data.transactionLogs = ctx.transactionLogs;
+      data.relatedRecords = ctx.relatedRecords;
+      return;
+    }
+
+    if (action === 'create_incident') {
+      var incResult = createIncidentFromLog(input);
+      data.incident_number = incResult.incident_number;
+      return;
+    }
+
+    if (action === 'export_data') {
+      data.exportContent = prepareExportData(
+        input.format || 'csv',
+        input.filters || {},
+        input.sort || {}
+      );
+      return;
+    }
+  }
+
+  // ---- Initial page load ----
+  var defaultFilters = {
+    logSource: '',
+    severity: { info: true, warning: true, error: true, critical: true },
+    timeRange: '24h',
+    sourceApp: '',
+    keyword: ''
+  };
+
+  var defaultPagination = { currentPage: 1, pageSize: 50 };
+  var defaultSort = { field: 'sys_created_on', direction: 'desc' };
+
+  var initialResult = fetchLogEntries(defaultFilters, defaultPagination, defaultSort);
+  data.logEntries = initialResult.logEntries;
+  data.totalRecords = initialResult.totalRecords;
+  data.stats = fetchStatistics(defaultFilters);
+  data.trendData = fetchTrendData();
+  data.sourcesAvailable = fetchSourcesAvailable();
+  data.lastRefreshed = new GlideDateTime().getDisplayValue();
+
+})();]]></script>
+<servicenow>false</servicenow>
+<sys_class_name>sp_widget</sys_class_name>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-02-08 08:37:47</sys_created_on>
+<sys_id>6ba161bf93be765013b7326efaba1002</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_name>SYSTEM LOG VIEWER WIDGET REQUIREMENTS SP</sys_name>
+<sys_package display_value="Global" source="global">global</sys_package>
+<sys_policy/>
+<sys_scope display_value="Global">global</sys_scope>
+<sys_update_name>sp_widget_6ba161bf93be765013b7326efaba1002</sys_update_name>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-02-08 08:37:47</sys_updated_on>
+<template><![CDATA[<div class="syslog-viewer-widget" role="main" aria-label="System Log Viewer">
+  <!-- Header Section -->
+  <div class="slv-header">
+    <div class="slv-header-content">
+      <div class="slv-title-area">
+        <h2 class="slv-title">
+          <i class="fa fa-terminal" aria-hidden="true"></i>
+          System Log Viewer
+        </h2>
+        <span class="slv-subtitle">Real-time system log monitoring and analysis</span>
+      </div>
+      <div class="slv-header-actions">
+        <div class="slv-refresh-controls">
+          <span class="slv-last-updated" aria-live="polite">
+            Last updated: {{c.data.lastRefreshed || 'Never'}}
+          </span>
+          <div class="slv-refresh-interval">
+            <label for="refreshInterval" class="sr-only">Auto-refresh interval</label>
+            <select id="refreshInterval" class="slv-select slv-select-sm"
+                    ng-model="c.refreshInterval"
+                    ng-change="c.setRefreshInterval()"
+                    aria-label="Select auto-refresh interval">
+              <option value="0">No auto-refresh</option>
+              <option value="30000">Every 30 seconds</option>
+              <option value="60000">Every 1 minute</option>
+              <option value="300000">Every 5 minutes</option>
+            </select>
+          </div>
+          <button class="slv-btn slv-btn-icon slv-btn-refresh"
+                  ng-click="c.refreshLogs()"
+                  ng-disabled="c.loading"
+                  aria-label="Refresh log data now"
+                  title="Refresh now">
+            <i class="fa fa-refresh" ng-class="{'fa-spin': c.loading}" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Statistics Dashboard -->
+  <div class="slv-stats-dashboard" ng-if="c.showStats" role="region" aria-label="Log statistics summary">
+    <div class="slv-stats-row">
+      <div class="slv-stat-card slv-stat-info">
+        <div class="slv-stat-icon"><i class="fa fa-info-circle" aria-hidden="true"></i></div>
+        <div class="slv-stat-content">
+          <span class="slv-stat-value">{{c.data.stats.info || 0}}</span>
+          <span class="slv-stat-label">Informational</span>
+        </div>
+        <div class="slv-stat-trend" ng-if="c.data.stats.infoTrend">
+          <span ng-class="{'slv-trend-up': c.data.stats.infoTrend > 0, 'slv-trend-down': c.data.stats.infoTrend < 0}">
+            <i class="fa" ng-class="{'fa-arrow-up': c.data.stats.infoTrend > 0, 'fa-arrow-down': c.data.stats.infoTrend < 0}" aria-hidden="true"></i>
+            {{Math.abs(c.data.stats.infoTrend)}}%
+          </span>
+        </div>
+      </div>
+      <div class="slv-stat-card slv-stat-warning">
+        <div class="slv-stat-icon"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i></div>
+        <div class="slv-stat-content">
+          <span class="slv-stat-value">{{c.data.stats.warning || 0}}</span>
+          <span class="slv-stat-label">Warnings</span>
+        </div>
+      </div>
+      <div class="slv-stat-card slv-stat-error">
+        <div class="slv-stat-icon"><i class="fa fa-times-circle" aria-hidden="true"></i></div>
+        <div class="slv-stat-content">
+          <span class="slv-stat-value">{{c.data.stats.error || 0}}</span>
+          <span class="slv-stat-label">Errors</span>
+        </div>
+      </div>
+      <div class="slv-stat-card slv-stat-critical">
+        <div class="slv-stat-icon"><i class="fa fa-fire" aria-hidden="true"></i></div>
+        <div class="slv-stat-content">
+          <span class="slv-stat-value">{{c.data.stats.critical || 0}}</span>
+          <span class="slv-stat-label">Critical</span>
+        </div>
+      </div>
+      <div class="slv-stat-card slv-stat-total">
+        <div class="slv-stat-icon"><i class="fa fa-database" aria-hidden="true"></i></div>
+        <div class="slv-stat-content">
+          <span class="slv-stat-value">{{c.data.stats.total || 0}}</span>
+          <span class="slv-stat-label">Total (24h)</span>
+        </div>
+      </div>
+    </div>
+    <!-- Trend Chart -->
+    <div class="slv-trend-chart-container" ng-if="c.data.trendData && c.data.trendData.length > 0">
+      <h3 class="slv-section-title">Log Volume Trend (Last 24 Hours)</h3>
+      <div class="slv-trend-chart" aria-label="Log volume trend chart">
+        <div class="slv-chart-bars">
+          <div class="slv-chart-bar-wrapper" ng-repeat="point in c.data.trendData track by $index"
+               title="{{point.label}}: {{point.count}} entries">
+            <div class="slv-chart-bar"
+                 ng-style="{'height': c.getBarHeight(point.count) + '%'}"
+                 ng-class="{'slv-chart-bar-spike': point.isSpike}">
+              <span class="slv-chart-bar-value" ng-if="point.count > 0">{{point.count}}</span>
+            </div>
+            <span class="slv-chart-bar-label">{{point.shortLabel}}</span>
+          </div>
+        </div>
+        <div class="slv-chart-legend">
+          <span class="slv-chart-legend-item">
+            <span class="slv-legend-color slv-legend-normal" aria-hidden="true"></span> Normal volume
+          </span>
+          <span class="slv-chart-legend-item">
+            <span class="slv-legend-color slv-legend-spike" aria-hidden="true"></span> Spike detected (>2σ)
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="slv-btn slv-btn-link slv-toggle-stats" ng-click="c.showStats = !c.showStats">
+    <i class="fa" ng-class="c.showStats ? 'fa-chevron-up' : 'fa-chevron-down'" aria-hidden="true"></i>
+    {{c.showStats ? 'Hide' : 'Show'}} Statistics Dashboard
+  </button>
+
+  <!-- Filter Section -->
+  <div class="slv-filter-section" role="search" aria-label="Log filters">
+    <div class="slv-filter-header" ng-click="c.showFilters = !c.showFilters"
+         tabindex="0" role="button"
+         aria-expanded="{{c.showFilters}}"
+         ng-keypress="($event.keyCode === 13 || $event.keyCode === 32) && (c.showFilters = !c.showFilters)">
+      <h3 class="slv-section-title">
+        <i class="fa fa-filter" aria-hidden="true"></i> Filters
+        <span class="slv-active-filters-badge" ng-if="c.getActiveFilterCount() > 0">
+          {{c.getActiveFilterCount()}}
+        </span>
+      </h3>
+      <i class="fa" ng-class="c.showFilters ? 'fa-chevron-up' : 'fa-chevron-down'" aria-hidden="true"></i>
+    </div>
+
+    <div class="slv-filter-body" ng-show="c.showFilters" role="group" aria-label="Filter controls">
+      <div class="slv-filter-row">
+        <!-- Log Source -->
+        <div class="slv-filter-group">
+          <label for="logSource" class="slv-filter-label">Log Source</label>
+          <select id="logSource" class="slv-select"
+                  ng-model="c.filters.logSource"
+                  aria-label="Filter by log source">
+            <option value="">All Sources</option>
+            <option value="syslog">Syslog</option>
+            <option value="sys_log">System Log</option>
+            <option value="sys_email_log">Email Log</option>
+            <option value="sysevent">Events</option>
+          </select>
+        </div>
+
+        <!-- Severity Level -->
+        <div class="slv-filter-group">
+          <label class="slv-filter-label">Severity Level</label>
+          <div class="slv-checkbox-group" role="group" aria-label="Severity level filters">
+            <label class="slv-checkbox-label slv-severity-info-check">
+              <input type="checkbox" ng-model="c.filters.severity.info" aria-label="Informational">
+              <span class="slv-checkbox-text">Info</span>
+            </label>
+            <label class="slv-checkbox-label slv-severity-warning-check">
+              <input type="checkbox" ng-model="c.filters.severity.warning" aria-label="Warning">
+              <span class="slv-checkbox-text">Warning</span>
+            </label>
+            <label class="slv-checkbox-label slv-severity-error-check">
+              <input type="checkbox" ng-model="c.filters.severity.error" aria-label="Error">
+              <span class="slv-checkbox-text">Error</span>
+            </label>
+            <label class="slv-checkbox-label slv-severity-critical-check">
+              <input type="checkbox" ng-model="c.filters.severity.critical" aria-label="Critical">
+              <span class="slv-checkbox-text">Critical</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Time Range -->
+        <div class="slv-filter-group">
+          <label for="timeRange" class="slv-filter-label">Time Range</label>
+          <select id="timeRange" class="slv-select"
+                  ng-model="c.filters.timeRange"
+                  aria-label="Filter by time range">
+            <option value="1h">Last 1 Hour</option>
+            <option value="4h">Last 4 Hours</option>
+            <option value="24h">Last 24 Hours</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+            <option value="custom">Custom Range</option>
+          </select>
+        </div>
+
+        <!-- Source Application -->
+        <div class="slv-filter-group">
+          <label for="sourceApp" class="slv-filter-label">Source Application</label>
+          <select id="sourceApp" class="slv-select"
+                  ng-model="c.filters.sourceApp"
+                  aria-label="Filter by source application">
+            <option value="">All Applications</option>
+            <option ng-repeat="src in c.data.sourcesAvailable track by src"
+                    value="{{src}}">{{src}}</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Custom date range -->
+      <div class="slv-filter-row" ng-if="c.filters.timeRange === 'custom'">
+        <div class="slv-filter-group">
+          <label for="dateFrom" class="slv-filter-label">From Date</label>
+          <input type="datetime-local" id="dateFrom" class="slv-input"
+                 ng-model="c.filters.dateFrom" aria-label="Start date and time">
+        </div>
+        <div class="slv-filter-group">
+          <label for="dateTo" class="slv-filter-label">To Date</label>
+          <input type="datetime-local" id="dateTo" class="slv-input"
+                 ng-model="c.filters.dateTo" aria-label="End date and time">
+        </div>
+      </div>
+
+      <!-- Keyword Search -->
+      <div class="slv-filter-row">
+        <div class="slv-filter-group slv-filter-group-search">
+          <label for="keywordSearch" class="slv-filter-label">Keyword Search</label>
+          <div class="slv-search-input-wrapper">
+            <i class="fa fa-search slv-search-icon" aria-hidden="true"></i>
+            <input type="text" id="keywordSearch" class="slv-input slv-input-search"
+                   ng-model="c.filters.keyword"
+                   ng-model-options="{debounce: 500}"
+                   placeholder="Search log messages, sources, stack traces..."
+                   aria-label="Search keywords in log entries">
+            <button class="slv-btn slv-btn-clear-search" ng-if="c.filters.keyword"
+                    ng-click="c.filters.keyword = ''"
+                    aria-label="Clear search">
+              <i class="fa fa-times" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter Actions -->
+      <div class="slv-filter-actions">
+        <button class="slv-btn slv-btn-primary" ng-click="c.applyFilters()"
+                ng-disabled="c.loading" aria-label="Apply filters">
+          <i class="fa fa-check" aria-hidden="true"></i> Apply Filters
+        </button>
+        <button class="slv-btn slv-btn-secondary" ng-click="c.resetFilters()"
+                aria-label="Reset all filters">
+          <i class="fa fa-undo" aria-hidden="true"></i> Reset
+        </button>
+        <button class="slv-btn slv-btn-secondary" ng-click="c.savePreferences()"
+                aria-label="Save current filter preferences">
+          <i class="fa fa-save" aria-hidden="true"></i> Save Preferences
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="slv-toolbar">
+    <div class="slv-toolbar-left">
+      <span class="slv-record-count" aria-live="polite">
+        Showing {{c.getShowingRange()}} of {{c.data.totalRecords || 0}} records
+      </span>
+    </div>
+    <div class="slv-toolbar-right">
+      <!-- Export Buttons -->
+      <div class="slv-export-group">
+        <button class="slv-btn slv-btn-outline" ng-click="c.exportData('csv')"
+                ng-disabled="c.exporting || !c.data.logEntries.length"
+                aria-label="Export log data as CSV file">
+          <i class="fa fa-file-text-o" aria-hidden="true"></i> Export CSV
+        </button>
+        <button class="slv-btn slv-btn-outline" ng-click="c.exportData('json')"
+                ng-disabled="c.exporting || !c.data.logEntries.length"
+                aria-label="Export log data as JSON file">
+          <i class="fa fa-file-code-o" aria-hidden="true"></i> Export JSON
+        </button>
+      </div>
+      <!-- Page Size -->
+      <div class="slv-page-size">
+        <label for="pageSize" class="slv-page-size-label">Per page:</label>
+        <select id="pageSize" class="slv-select slv-select-sm"
+                ng-model="c.pagination.pageSize"
+                ng-change="c.changePageSize()"
+                aria-label="Records per page">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div class="slv-loading-overlay" ng-if="c.loading" role="status" aria-label="Loading log entries">
+    <div class="slv-spinner">
+      <div class="slv-spinner-bounce slv-bounce1"></div>
+      <div class="slv-spinner-bounce slv-bounce2"></div>
+      <div class="slv-spinner-bounce slv-bounce3"></div>
+    </div>
+    <span class="slv-loading-text">Loading log entries...</span>
+  </div>
+
+  <!-- Log Entries Table -->
+  <div class="slv-log-table-wrapper" aria-live="polite" aria-atomic="false">
+    <div class="slv-empty-state" ng-if="!c.loading && (!c.data.logEntries || c.data.logEntries.length === 0)">
+      <i class="fa fa-inbox slv-empty-icon" aria-hidden="true"></i>
+      <h3>No Log Entries Found</h3>
+      <p>No log entries match the current filter criteria. Try adjusting your filters or expanding the time range.</p>
+      <button class="slv-btn slv-btn-primary" ng-click="c.resetFilters()">
+        <i class="fa fa-undo" aria-hidden="true"></i> Reset Filters
+      </button>
+    </div>
+
+    <table class="slv-log-table" ng-if="c.data.logEntries && c.data.logEntries.length > 0"
+           role="grid" aria-label="System log entries">
+      <thead>
+        <tr role="row">
+          <th class="slv-th-severity" role="columnheader" scope="col" aria-label="Severity">
+            <span class="sr-only">Severity</span>
+          </th>
+          <th class="slv-th-timestamp" role="columnheader" scope="col"
+              ng-click="c.sortBy('sys_created_on')" tabindex="0"
+              ng-keypress="($event.keyCode === 13) && c.sortBy('sys_created_on')"
+              aria-sort="{{c.getSortAriaLabel('sys_created_on')}}">
+            Timestamp
+            <i class="fa" ng-class="c.getSortIcon('sys_created_on')" aria-hidden="true"></i>
+          </th>
+          <th class="slv-th-source" role="columnheader" scope="col"
+              ng-click="c.sortBy('source')" tabindex="0"
+              ng-keypress="($event.keyCode === 13) && c.sortBy('source')">
+            Source
+            <i class="fa" ng-class="c.getSortIcon('source')" aria-hidden="true"></i>
+          </th>
+          <th class="slv-th-level" role="columnheader" scope="col"
+              ng-click="c.sortBy('level')" tabindex="0"
+              ng-keypress="($event.keyCode === 13) && c.sortBy('level')">
+            Level
+            <i class="fa" ng-class="c.getSortIcon('level')" aria-hidden="true"></i>
+          </th>
+          <th class="slv-th-message" role="columnheader" scope="col">Message</th>
+          <th class="slv-th-table" role="columnheader" scope="col">Table/Type</th>
+          <th class="slv-th-actions" role="columnheader" scope="col">
+            <span class="sr-only">Actions</span>
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr ng-repeat-start="entry in c.data.logEntries track by entry.sys_id"
+            class="slv-log-row"
+            ng-class="c.getSeverityClass(entry.level)"
+            ng-click="c.toggleExpand(entry)"
+            ng-keypress="($event.keyCode === 13 || $event.keyCode === 32) && c.toggleExpand(entry)"
+            tabindex="0"
+            role="row"
+            aria-expanded="{{entry.expanded || false}}"
+            aria-label="{{c.getSeverityLabel(entry.level)}} log entry from {{entry.source}} at {{entry.sys_created_on}}">
+          <td class="slv-td-severity" role="gridcell">
+            <span class="slv-severity-badge" ng-class="'slv-severity-' + c.normalizeSeverity(entry.level)"
+                  aria-label="{{c.getSeverityLabel(entry.level)}}">
+              <i class="fa" ng-class="c.getSeverityIcon(entry.level)" aria-hidden="true"></i>
+            </span>
+          </td>
+          <td class="slv-td-timestamp" role="gridcell">
+            <span class="slv-timestamp">{{entry.sys_created_on}}</span>
+            <span class="slv-time-ago">{{c.getTimeAgo(entry.sys_created_on)}}</span>
+          </td>
+          <td class="slv-td-source" role="gridcell">
+            <span class="slv-source-tag">{{entry.source}}</span>
+            <span class="slv-log-table-name" ng-if="entry.logTable">{{entry.logTable}}</span>
+          </td>
+          <td class="slv-td-level" role="gridcell">
+            <span class="slv-level-label" ng-class="'slv-level-' + c.normalizeSeverity(entry.level)">
+              {{c.getSeverityLabel(entry.level)}}
+            </span>
+          </td>
+          <td class="slv-td-message" role="gridcell">
+            <span class="slv-message-text" ng-bind-html="c.highlightKeyword(c.truncateMessage(entry.message, entry.expanded))"></span>
+          </td>
+          <td class="slv-td-table" role="gridcell">
+            <span class="slv-table-badge" ng-if="entry.table_name">{{entry.table_name}}</span>
+            <span class="slv-type-badge" ng-if="entry.type">{{entry.type}}</span>
+          </td>
+          <td class="slv-td-actions" role="gridcell">
+            <div class="slv-action-buttons" ng-click="$event.stopPropagation()">
+              <button class="slv-btn slv-btn-action" ng-click="c.createIncident(entry)"
+                      title="Create incident from this log entry"
+                      aria-label="Create incident from this log entry">
+                <i class="fa fa-ticket" aria-hidden="true"></i>
+              </button>
+              <button class="slv-btn slv-btn-action" ng-click="c.acknowledgeEntry(entry)"
+                      title="Acknowledge this log entry"
+                      aria-label="Acknowledge log entry"
+                      ng-class="{'slv-acknowledged': entry.acknowledged}">
+                <i class="fa" ng-class="entry.acknowledged ? 'fa-check-circle' : 'fa-check'" aria-hidden="true"></i>
+              </button>
+              <button class="slv-btn slv-btn-action" ng-click="c.toggleExpand(entry)"
+                      title="{{entry.expanded ? 'Collapse' : 'Expand'}} details"
+                      aria-label="{{entry.expanded ? 'Collapse' : 'Expand'}} log entry details">
+                <i class="fa" ng-class="entry.expanded ? 'fa-chevron-up' : 'fa-chevron-down'" aria-hidden="true"></i>
+              </button>
+            </div>
+          </td>
+        </tr>
+        <!-- Expanded Detail Row -->
+        <tr ng-repeat-end ng-if="entry.expanded" class="slv-detail-row" ng-class="c.getSeverityClass(entry.level)">
+          <td colspan="7" class="slv-detail-cell">
+            <div class="slv-detail-content">
+              <div class="slv-detail-grid">
+                <div class="slv-detail-section">
+                  <h4 class="slv-detail-section-title">Full Message</h4>
+                  <pre class="slv-detail-message">{{entry.message}}</pre>
+                </div>
+                <div class="slv-detail-section" ng-if="entry.stack_trace">
+                  <h4 class="slv-detail-section-title">Stack Trace</h4>
+                  <pre class="slv-detail-stacktrace">{{entry.stack_trace}}</pre>
+                </div>
+                <div class="slv-detail-section slv-detail-metadata">
+                  <h4 class="slv-detail-section-title">Metadata</h4>
+                  <div class="slv-metadata-grid">
+                    <div class="slv-metadata-item" ng-if="entry.sys_id">
+                      <span class="slv-metadata-key">Sys ID:</span>
+                      <span class="slv-metadata-value">{{entry.sys_id}}</span>
+                    </div>
+                    <div class="slv-metadata-item" ng-if="entry.sys_created_by">
+                      <span class="slv-metadata-key">Created By:</span>
+                      <span class="slv-metadata-value">{{entry.sys_created_by}}</span>
+                    </div>
+                    <div class="slv-metadata-item" ng-if="entry.transaction_id">
+                      <span class="slv-metadata-key">Transaction ID:</span>
+                      <span class="slv-metadata-value">{{entry.transaction_id}}</span>
+                    </div>
+                    <div class="slv-metadata-item" ng-if="entry.method">
+                      <span class="slv-metadata-key">Method:</span>
+                      <span class="slv-metadata-value">{{entry.method}}</span>
+                    </div>
+                    <div class="slv-metadata-item" ng-if="entry.elapsed_time">
+                      <span class="slv-metadata-key">Elapsed Time:</span>
+                      <span class="slv-metadata-value">{{entry.elapsed_time}} ms</span>
+                    </div>
+                    <div class="slv-metadata-item" ng-if="entry.logTable">
+                      <span class="slv-metadata-key">Log Table:</span>
+                      <span class="slv-metadata-value">{{entry.logTable}}</span>
+                    </div>
+                  </div>
+                </div>
+                <!-- Related Records -->
+                <div class="slv-detail-section" ng-if="entry.relatedRecords && entry.relatedRecords.length > 0">
+                  <h4 class="slv-detail-section-title">Related Records</h4>
+                  <div class="slv-related-records">
+                    <div class="slv-related-record" ng-repeat="rel in entry.relatedRecords track by $index">
+                      <i class="fa fa-link" aria-hidden="true"></i>
+                      <a href="?id=form&table={{rel.table}}&sys_id={{rel.sys_id}}" class="slv-related-link">
+                        {{rel.display}} ({{rel.table}})
+                      </a>
+                    </div>
+                  </div>
+                </div>
+                <!-- Related Transaction Logs -->
+                <div class="slv-detail-section" ng-if="entry.transactionLogs && entry.transactionLogs.length > 0">
+                  <h4 class="slv-detail-section-title">Transaction Context ({{entry.transactionLogs.length}} related entries)</h4>
+                  <div class="slv-transaction-logs">
+                    <div class="slv-mini-log-entry" ng-repeat="tLog in entry.transactionLogs track by tLog.sys_id"
+                         ng-class="'slv-mini-' + c.normalizeSeverity(tLog.level)">
+                      <span class="slv-mini-time">{{tLog.sys_created_on}}</span>
+                      <span class="slv-mini-level">{{c.getSeverityLabel(tLog.level)}}</span>
+                      <span class="slv-mini-message">{{c.truncateMessage(tLog.message, false)}}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="slv-detail-actions">
+                <button class="slv-btn slv-btn-primary slv-btn-sm" ng-click="c.createIncident(entry)">
+                  <i class="fa fa-ticket" aria-hidden="true"></i> Create Incident
+                </button>
+                <button class="slv-btn slv-btn-secondary slv-btn-sm" ng-click="c.copyToClipboard(entry)">
+                  <i class="fa fa-clipboard" aria-hidden="true"></i> Copy Details
+                </button>
+                <button class="slv-btn slv-btn-secondary slv-btn-sm" ng-click="c.loadTransactionContext(entry)"
+                        ng-if="entry.transaction_id && !entry.transactionLogs">
+                  <i class="fa fa-sitemap" aria-hidden="true"></i> Load Transaction Context
+                </button>
+              </div>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Pagination -->
+  <div class="slv-pagination" ng-if="c.data.totalRecords > 0" role="navigation" aria-label="Log entries pagination">
+    <div class="slv-pagination-info">
+      Page {{c.pagination.currentPage}} of {{c.getTotalPages()}}
+    </div>
+    <div class="slv-pagination-controls">
+      <button class="slv-btn slv-btn-page" ng-click="c.goToPage(1)"
+              ng-disabled="c.pagination.currentPage <= 1"
+              aria-label="Go to first page">
+        <i class="fa fa-angle-double-left" aria-hidden="true"></i>
+      </button>
+      <button class="slv-btn slv-btn-page" ng-click="c.goToPage(c.pagination.currentPage - 1)"
+              ng-disabled="c.pagination.currentPage <= 1"
+              aria-label="Go to previous page">
+        <i class="fa fa-angle-left" aria-hidden="true"></i>
+      </button>
+      <button class="slv-btn slv-btn-page" ng-repeat="page in c.getPageNumbers() track by $index"
+              ng-click="c.goToPage(page)"
+              ng-class="{'slv-btn-page-active': page === c.pagination.currentPage}"
+              ng-disabled="page === '...'"
+              aria-label="Go to page {{page}}"
+              aria-current="{{page === c.pagination.currentPage ? 'page' : ''}}">
+        {{page}}
+      </button>
+      <button class="slv-btn slv-btn-page" ng-click="c.goToPage(c.pagination.currentPage + 1)"
+              ng-disabled="c.pagination.currentPage >= c.getTotalPages()"
+              aria-label="Go to next page">
+        <i class="fa fa-angle-right" aria-hidden="true"></i>
+      </button>
+      <button class="slv-btn slv-btn-page" ng-click="c.goToPage(c.getTotalPages())"
+              ng-disabled="c.pagination.currentPage >= c.getTotalPages()"
+              aria-label="Go to last page">
+        <i class="fa fa-angle-double-right" aria-hidden="true"></i>
+      </button>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="slv-toast" ng-if="c.toast.show" ng-class="'slv-toast-' + c.toast.type"
+       role="alert" aria-live="assertive">
+    <i class="fa" ng-class="c.getToastIcon()" aria-hidden="true"></i>
+    <span>{{c.toast.message}}</span>
+    <button class="slv-btn slv-btn-toast-close" ng-click="c.toast.show = false" aria-label="Close notification">
+      <i class="fa fa-times" aria-hidden="true"></i>
+    </button>
+  </div>
+</div>]]></template>
+<u_search_keys/>
+</sp_widget>
+</unload>

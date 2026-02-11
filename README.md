@@ -15,6 +15,7 @@ Each widget is packaged as an **Update Set XML** file that can be imported direc
 | [Instance Health Monitor](./instance-health-monitor/) | Real-time instance health dashboard with CPU, memory, node status, transaction performance, scheduled jobs, cache metrics, and configurable alert thresholds. | `instance-health-monitor/` |
 | [System Log Viewer](./system-log-viewer/) | Real-time system log monitoring and analysis widget with severity filtering, 24-hour trend visualization, multi-source aggregation, keyword search, CSV/JSON export, and incident creation. | `system-log-viewer/` |
 | [Scheduled Job Status Tracker](./scheduled-job-tracker/) | Real-time scheduled job monitoring widget with status dashboard, execution history, success rate tracking, admin controls, CSV export, and multi-column sorting. | `scheduled-job-tracker/` |
+| [Update Set Migration Tracker](./update-set-migration-tracker/) | Real-time update set migration dashboard with statistics, environment progress tracking (DEV→TEST→PROD), conflict detection, CSV export, and deployment approval workflows. | `update-set-migration-tracker/` |
 
 ---
 

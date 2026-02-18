@@ -16,6 +16,7 @@ Each widget is packaged as an **Update Set XML** file that can be imported direc
 | [System Log Viewer](./system-log-viewer/) | Real-time system log monitoring and analysis widget with severity filtering, 24-hour trend visualization, multi-source aggregation, keyword search, CSV/JSON export, and incident creation. | `system-log-viewer/` |
 | [Scheduled Job Status Tracker](./scheduled-job-tracker/) | Real-time scheduled job monitoring widget with status dashboard, execution history, success rate tracking, admin controls, CSV export, and multi-column sorting. | `scheduled-job-tracker/` |
 | [Update Set Migration Tracker](./update-set-migration-tracker/) 🔥 | Real-time update set migration dashboard with statistics, environment progress tracking (DEV→TEST→PROD), conflict detection, CSV export, and deployment approval workflows. | `update-set-migration-tracker/` |
+| [Change Task Progress](./change-task-progress/) | Change task completion dashboard with interactive progress bar, state drill-down, velocity metrics, threshold alerts, filtering, sorting, and CSV/PDF export. | `change-task-progress/` |
 
 ---
 

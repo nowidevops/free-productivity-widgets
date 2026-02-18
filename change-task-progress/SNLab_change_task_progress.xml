@@ -1,0 +1,2541 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<unload unload_date="2026-02-18 16:48:52">
+<sp_widget action="INSERT_OR_UPDATE">
+<category>custom</category>
+<client_script><![CDATA[api.controller = function($scope, $interval, $timeout, $window) {
+  var c = this;
+
+  // =============================
+  // Initialization
+  // =============================
+  c.loading = true;
+  c.refreshing = false;
+  c.error = null;
+  c.autoRefreshEnabled = false;
+  c.autoRefreshInterval = 60000; // 60 seconds
+  c.alertDismissed = false;
+
+  // Filter state
+  c.filters = {
+    assignmentGroup: '',
+    priority: '',
+    state: ''
+  };
+
+  // Sort state
+  c.sortField = 'number';
+  c.sortReverse = false;
+
+  // Filtered tasks
+  c.filteredTasks = [];
+
+  // Auto-refresh handle
+  var autoRefreshHandle = null;
+
+  // =============================
+  // Data Initialization
+  // =============================
+  function initializeData() {
+    if (c.data && c.data.changeRequest && c.data.changeRequest.sys_id) {
+      c.filteredTasks = angular.copy(c.data.tasks || []);
+      applyLocalFilters();
+      c.loading = false;
+      c.error = null;
+
+      // Check for threshold alert
+      if (c.data.thresholdAlert && c.data.thresholdAlert.active && !c.alertDismissed) {
+        c.data.thresholdAlert.active = true;
+      }
+
+      // Start auto-refresh if configured
+      if (c.data.options && c.data.options.autoRefresh) {
+        c.autoRefreshEnabled = true;
+        c.autoRefreshInterval = (c.data.options.refreshInterval || 60) * 1000;
+        startAutoRefresh();
+      }
+    } else if (c.data && c.data.error) {
+      c.error = c.data.error;
+      c.loading = false;
+    } else {
+      c.loading = false;
+    }
+  }
+
+  // Run initialization
+  $timeout(function() {
+    initializeData();
+  }, 0);
+
+  // =============================
+  // Progress Color Class
+  // =============================
+  c.getProgressColorClass = function() {
+    if (!c.data || !c.data.stats) return '';
+    var pct = c.data.stats.completionPercentage || 0;
+    var threshold = c.data.options ? c.data.options.threshold : 50;
+
+    if (pct >= 75) return 'ctp-progress-green';
+    if (pct >= threshold) return 'ctp-progress-yellow';
+    return 'ctp-progress-red';
+  };
+
+  // =============================
+  // Change State Badge Class
+  // =============================
+  c.getChangeStateBadgeClass = function() {
+    if (!c.data || !c.data.changeRequest) return '';
+    var state = c.data.changeRequest.state;
+    switch (state) {
+      case '-5': return 'ctp-badge-state'; // New
+      case '-4': return 'ctp-badge-state'; // Assess
+      case '-3': return 'ctp-badge-state'; // Authorize
+      case '-2': return 'ctp-badge-state'; // Scheduled
+      case '-1': return 'ctp-badge-state'; // Implement
+      case '0':  return 'ctp-badge-state'; // Review
+      case '3':  return 'ctp-badge-state'; // Closed
+      default:   return 'ctp-badge-state';
+    }
+  };
+
+  // =============================
+  // State Display Helpers
+  // =============================
+  c.getStateLabel = function(state) {
+    var stateMap = {
+      '1': 'Open',
+      '2': 'Work in Progress',
+      '3': 'Closed Complete',
+      '4': 'Closed Incomplete'
+    };
+    return stateMap[state] || 'Unknown';
+  };
+
+  c.getStateIcon = function(state) {
+    var iconMap = {
+      '1': '○',
+      '2': '⟳',
+      '3': '✓',
+      '4': '✕'
+    };
+    return iconMap[state] || '?';
+  };
+
+  c.getStateBadgeClass = function(state) {
+    var classMap = {
+      '1': 'ctp-state-open',
+      '2': 'ctp-state-wip',
+      '3': 'ctp-state-closed-complete',
+      '4': 'ctp-state-closed-incomplete'
+    };
+    return classMap[state] || '';
+  };
+
+  // =============================
+  // Segment Click (Drill-Down)
+  // =============================
+  c.onSegmentClick = function(state) {
+    c.filters.state = state;
+    c.applyFilters();
+
+    // Scroll to task list
+    $timeout(function() {
+      var taskSection = document.querySelector('.ctp-task-list-section');
+      if (taskSection) {
+        taskSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  };
+
+  c.handleSegmentKeydown = function($event, state) {
+    if ($event.key === 'Enter' || $event.key === ' ') {
+      $event.preventDefault();
+      c.onSegmentClick(state);
+    }
+  };
+
+  // =============================
+  // Filtering
+  // =============================
+  c.applyFilters = function() {
+    applyLocalFilters();
+  };
+
+  function applyLocalFilters() {
+    if (!c.data || !c.data.tasks) {
+      c.filteredTasks = [];
+      return;
+    }
+
+    var tasks = angular.copy(c.data.tasks);
+
+    // Filter by assignment group
+    if (c.filters.assignmentGroup) {
+      tasks = tasks.filter(function(task) {
+        return task.assignment_group === c.filters.assignmentGroup;
+      });
+    }
+
+    // Filter by priority
+    if (c.filters.priority) {
+      tasks = tasks.filter(function(task) {
+        return task.priority === c.filters.priority;
+      });
+    }
+
+    // Filter by state
+    if (c.filters.state) {
+      tasks = tasks.filter(function(task) {
+        return task.state === c.filters.state;
+      });
+    }
+
+    // Apply sorting
+    tasks.sort(function(a, b) {
+      var aVal = a[c.sortField] || '';
+      var bVal = b[c.sortField] || '';
+
+      if (typeof aVal === 'string') {
+        aVal = aVal.toLowerCase();
+        bVal = bVal.toLowerCase();
+      }
+
+      var comparison = 0;
+      if (aVal < bVal) comparison = -1;
+      if (aVal > bVal) comparison = 1;
+
+      return c.sortReverse ? -comparison : comparison;
+    });
+
+    c.filteredTasks = tasks;
+  }
+
+  c.clearFilters = function() {
+    c.filters = {
+      assignmentGroup: '',
+      priority: '',
+      state: ''
+    };
+    applyLocalFilters();
+  };
+
+  c.hasActiveFilters = function() {
+    return c.filters.assignmentGroup || c.filters.priority || c.filters.state;
+  };
+
+  // =============================
+  // Sorting
+  // =============================
+  c.sortTasks = function(field) {
+    if (c.sortField === field) {
+      c.sortReverse = !c.sortReverse;
+    } else {
+      c.sortField = field;
+      c.sortReverse = false;
+    }
+    applyLocalFilters();
+  };
+
+  c.handleSortKeydown = function($event, field) {
+    if ($event.key === 'Enter' || $event.key === ' ') {
+      $event.preventDefault();
+      c.sortTasks(field);
+    }
+  };
+
+  c.getSortIcon = function(field) {
+    if (c.sortField !== field) return 'fa-sort';
+    return c.sortReverse ? 'fa-sort-desc' : 'fa-sort-asc';
+  };
+
+  // =============================
+  // Data Refresh
+  // =============================
+  c.refreshData = function() {
+    c.refreshing = true;
+    c.data.action = 'refresh';
+
+    c.server.update().then(function(response) {
+      if (response && response.data) {
+        // Preserve filter state during refresh
+        var currentFilters = angular.copy(c.filters);
+        c.data = response.data;
+        c.filters = currentFilters;
+        applyLocalFilters();
+        c.error = null;
+      }
+      c.refreshing = false;
+    }, function(error) {
+      c.error = 'Failed to refresh data. Please try again.';
+      c.refreshing = false;
+    });
+  };
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    autoRefreshHandle = $interval(function() {
+      c.refreshData();
+    }, c.autoRefreshInterval);
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshHandle) {
+      $interval.cancel(autoRefreshHandle);
+      autoRefreshHandle = null;
+    }
+  }
+
+  // =============================
+  // Alert Dismiss
+  // =============================
+  c.dismissAlert = function() {
+    c.alertDismissed = true;
+    if (c.data.thresholdAlert) {
+      c.data.thresholdAlert.active = false;
+    }
+  };
+
+  // =============================
+  // Export Functionality
+  // =============================
+  c.exportData = function(format) {
+    if (!c.data || !c.data.changeRequest) return;
+
+    var exportPayload = {
+      changeNumber: c.data.changeRequest.number,
+      changeDescription: c.data.changeRequest.short_description,
+      stats: c.data.stats,
+      velocity: c.data.velocity,
+      tasks: c.filteredTasks,
+      assignmentGroups: c.data.assignmentGroups,
+      exportFormat: format,
+      generatedAt: new Date().toISOString()
+    };
+
+    if (format === 'excel') {
+      generateCSVExport(exportPayload);
+    } else if (format === 'pdf') {
+      generatePrintableExport(exportPayload);
+    }
+  };
+
+  function generateCSVExport(payload) {
+    var csv = [];
+    var headerLine = 'Change Task Progress Report - ' + payload.changeNumber;
+    csv.push(headerLine);
+    csv.push('Generated: ' + payload.generatedAt);
+    csv.push('Description: ' + payload.changeDescription);
+    csv.push('');
+    csv.push('Overall Completion: ' + (payload.stats.completionPercentage || 0) + '%');
+    csv.push('Total Tasks: ' + (payload.stats.total || 0));
+    csv.push('');
+
+    // Task headers
+    csv.push('Number,Description,State,Priority,Assignment Group,Assigned To,Opened,Closed');
+
+    // Task rows
+    if (payload.tasks && payload.tasks.length > 0) {
+      payload.tasks.forEach(function(task) {
+        var row = [
+          '"' + (task.number || '') + '"',
+          '"' + (task.short_description || '').replace(/"/g, '""') + '"',
+          '"' + (c.getStateLabel(task.state)) + '"',
+          '"' + (task.priority_display || '') + '"',
+          '"' + (task.assignment_group_display || 'Unassigned') + '"',
+          '"' + (task.assigned_to_display || 'Unassigned') + '"',
+          '"' + (task.opened_at || '') + '"',
+          '"' + (task.closed_at || '') + '"'
+        ];
+        csv.push(row.join(','));
+      });
+    }
+
+    var csvContent = csv.join('\n');
+    var blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    var link = document.createElement('a');
+    var url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', payload.changeNumber + '_task_progress.csv');
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function generatePrintableExport(payload) {
+    var printWindow = $window.open('', '_blank');
+    if (!printWindow) return;
+
+    var html = '<!DOCTYPE html><html><head><title>Change Task Progress - ' + payload.changeNumber + '</title>';
+    html += '<style>';
+    html += 'body { font-family: Arial, sans-serif; margin: 20px; color: #333; }';
+    html += 'h1 { font-size: 18px; border-bottom: 2px solid #333; padding-bottom: 8px; }';
+    html += 'h2 { font-size: 15px; color: #555; margin-top: 24px; }';
+    html += '.meta { font-size: 12px; color: #666; margin-bottom: 16px; }';
+    html += '.stat-row { display: flex; gap: 24px; margin: 12px 0; }';
+    html += '.stat { padding: 8px 16px; background: #f5f5f5; border-radius: 4px; }';
+    html += '.stat-label { font-size: 11px; color: #888; text-transform: uppercase; }';
+    html += '.stat-value { font-size: 18px; font-weight: 700; }';
+    html += 'table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }';
+    html += 'th { background: #f0f0f0; padding: 8px; text-align: left; border-bottom: 2px solid #ddd; }';
+    html += 'td { padding: 6px 8px; border-bottom: 1px solid #eee; }';
+    html += '</style></head><body>';
+    html += '<h1>Change Task Progress Report</h1>';
+    html += '<div class="meta">' + payload.changeNumber + ' — ' + payload.changeDescription + '</div>';
+    html += '<div class="meta">Generated: ' + new Date(payload.generatedAt).toLocaleString() + '</div>';
+
+    html += '<h2>Summary</h2>';
+    html += '<div class="stat-row">';
+    html += '<div class="stat"><div class="stat-label">Completion</div><div class="stat-value">' + (payload.stats.completionPercentage || 0) + '%</div></div>';
+    html += '<div class="stat"><div class="stat-label">Total</div><div class="stat-value">' + (payload.stats.total || 0) + '</div></div>';
+    html += '<div class="stat"><div class="stat-label">Closed</div><div class="stat-value">' + (payload.stats.closedComplete || 0) + '</div></div>';
+    html += '<div class="stat"><div class="stat-label">In Progress</div><div class="stat-value">' + (payload.stats.wip || 0) + '</div></div>';
+    html += '<div class="stat"><div class="stat-label">Open</div><div class="stat-value">' + (payload.stats.open || 0) + '</div></div>';
+    html += '</div>';
+
+    html += '<h2>Tasks (' + payload.tasks.length + ')</h2>';
+    html += '<table><thead><tr><th>Number</th><th>Description</th><th>State</th><th>Priority</th><th>Group</th><th>Assignee</th></tr></thead><tbody>';
+
+    payload.tasks.forEach(function(task) {
+      html += '<tr>';
+      html += '<td>' + (task.number || '') + '</td>';
+      html += '<td>' + (task.short_description || '') + '</td>';
+      html += '<td>' + c.getStateLabel(task.state) + '</td>';
+      html += '<td>' + (task.priority_display || '') + '</td>';
+      html += '<td>' + (task.assignment_group_display || 'Unassigned') + '</td>';
+      html += '<td>' + (task.assigned_to_display || 'Unassigned') + '</td>';
+      html += '</tr>';
+    });
+
+    html += '</tbody></table>';
+    html += '</body></html>';
+
+    printWindow.document.write(html);
+    printWindow.document.close();
+    $timeout(function() {
+      printWindow.print();
+    }, 500);
+  }
+
+  // =============================
+  // Cleanup on Scope Destroy
+  // =============================
+  $scope.$on('$destroy', function() {
+    stopAutoRefresh();
+  });
+};]]></client_script>
+<controller_as>c</controller_as>
+<css>/* ==========================================================
+   Change Task Progress Widget — Scoped CSS
+   ========================================================== */
+
+.change-task-progress-widget {
+  /* CSS Variables scoped to widget root */
+  --ctp-bg-primary: #ffffff;
+  --ctp-bg-secondary: #f4f5f7;
+  --ctp-bg-tertiary: #e8eaed;
+  --ctp-text-primary: #1d1d1d;
+  --ctp-text-secondary: #485566;
+  --ctp-text-muted: #6b778c;
+  --ctp-border-color: #dfe1e6;
+  --ctp-border-radius: 6px;
+  --ctp-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --ctp-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
+  --ctp-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+  /* State Colors */
+  --ctp-green: #2e7d32;
+  --ctp-green-bg: #e8f5e9;
+  --ctp-green-light: #4caf50;
+  --ctp-yellow: #f57f17;
+  --ctp-yellow-bg: #fff8e1;
+  --ctp-yellow-light: #ffb300;
+  --ctp-red: #c62828;
+  --ctp-red-bg: #ffebee;
+  --ctp-red-light: #ef5350;
+  --ctp-blue: #1565c0;
+  --ctp-blue-bg: #e3f2fd;
+  --ctp-blue-light: #42a5f5;
+  --ctp-gray: #546e7a;
+  --ctp-gray-bg: #eceff1;
+  --ctp-gray-light: #90a4ae;
+
+  /* Progress Bar Colors */
+  --ctp-closed-complete: #2e7d32;
+  --ctp-closed-incomplete: #e65100;
+  --ctp-wip: #1565c0;
+  --ctp-open: #90a4ae;
+
+  /* Spacing */
+  --ctp-space-xs: 4px;
+  --ctp-space-sm: 8px;
+  --ctp-space-md: 16px;
+  --ctp-space-lg: 24px;
+  --ctp-space-xl: 32px;
+  --ctp-space-xxl: 48px;
+
+  /* Typography */
+  --ctp-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --ctp-font-size-xs: 11px;
+  --ctp-font-size-sm: 13px;
+  --ctp-font-size-base: 14px;
+  --ctp-font-size-md: 16px;
+  --ctp-font-size-lg: 20px;
+  --ctp-font-size-xl: 28px;
+
+  /* Transitions */
+  --ctp-transition-fast: 150ms ease-in-out;
+  --ctp-transition-normal: 250ms ease-in-out;
+  --ctp-transition-slow: 400ms ease-in-out;
+
+  position: relative;
+  font-family: var(--ctp-font-family);
+  font-size: var(--ctp-font-size-base);
+  color: var(--ctp-text-primary);
+  background: var(--ctp-bg-primary);
+  border-radius: var(--ctp-border-radius);
+  box-shadow: var(--ctp-shadow-sm);
+  border: 1px solid var(--ctp-border-color);
+  overflow: hidden;
+  min-width: 320px;
+}
+
+/* Loading Overlay */
+.change-task-progress-widget .ctp-loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.85);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+}
+
+.change-task-progress-widget .ctp-spinner {
+  text-align: center;
+  color: var(--ctp-blue);
+}
+
+/* Error State */
+.change-task-progress-widget .ctp-error-state,
+.change-task-progress-widget .ctp-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--ctp-space-xxl);
+  text-align: center;
+}
+
+.change-task-progress-widget .ctp-error-icon,
+.change-task-progress-widget .ctp-empty-icon {
+  font-size: 48px;
+  display: block;
+  margin-bottom: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-error-icon {
+  color: var(--ctp-red);
+}
+
+.change-task-progress-widget .ctp-empty-icon {
+  color: var(--ctp-gray-light);
+}
+
+.change-task-progress-widget .ctp-error-title,
+.change-task-progress-widget .ctp-empty-title {
+  font-size: var(--ctp-font-size-lg);
+  margin: 0 0 var(--ctp-space-sm) 0;
+  font-weight: 600;
+}
+
+.change-task-progress-widget .ctp-error-message,
+.change-task-progress-widget .ctp-empty-message {
+  color: var(--ctp-text-muted);
+  margin: 0 0 var(--ctp-space-md) 0;
+}
+
+/* Header */
+.change-task-progress-widget .ctp-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: var(--ctp-space-lg);
+  border-bottom: 1px solid var(--ctp-border-color);
+  gap: var(--ctp-space-md);
+  flex-wrap: wrap;
+}
+
+.change-task-progress-widget .ctp-title {
+  font-size: var(--ctp-font-size-lg);
+  font-weight: 700;
+  margin: 0 0 var(--ctp-space-xs) 0;
+  color: var(--ctp-text-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-sm);
+}
+
+.change-task-progress-widget .ctp-title-icon {
+  color: var(--ctp-blue);
+}
+
+.change-task-progress-widget .ctp-subtitle {
+  margin: 0;
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-secondary);
+}
+
+.change-task-progress-widget .ctp-change-link {
+  color: var(--ctp-blue);
+  font-weight: 600;
+  text-decoration: none;
+  transition: color var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-change-link:hover,
+.change-task-progress-widget .ctp-change-link:focus {
+  color: #0d47a1;
+  text-decoration: underline;
+}
+
+.change-task-progress-widget .ctp-separator {
+  margin: 0 var(--ctp-space-sm);
+  color: var(--ctp-text-muted);
+}
+
+.change-task-progress-widget .ctp-header-actions {
+  display: flex;
+  gap: var(--ctp-space-sm);
+  align-items: center;
+}
+
+/* Buttons */
+.change-task-progress-widget .ctp-btn {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: var(--ctp-border-radius);
+  transition: all var(--ctp-transition-fast);
+  font-size: var(--ctp-font-size-base);
+}
+
+.change-task-progress-widget .ctp-btn:focus {
+  outline: 3px solid var(--ctp-blue-light);
+  outline-offset: 2px;
+}
+
+.change-task-progress-widget .ctp-btn-icon {
+  padding: 8px 12px;
+}
+
+.change-task-progress-widget .ctp-btn-icon:hover {
+  background-color: var(--ctp-bg-secondary);
+}
+
+.change-task-progress-widget .ctp-btn-clear {
+  color: var(--ctp-red);
+  font-weight: 600;
+}
+
+/* Meta Bar */
+.change-task-progress-widget .ctp-meta-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ctp-space-lg);
+  padding: var(--ctp-space-md) var(--ctp-space-lg);
+  background: var(--ctp-bg-secondary);
+  border-bottom: 1px solid var(--ctp-border-color);
+}
+
+.change-task-progress-widget .ctp-meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.change-task-progress-widget .ctp-meta-label {
+  font-size: var(--ctp-font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ctp-text-muted);
+  font-weight: 600;
+}
+
+/* Badges */
+.change-task-progress-widget .ctp-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: var(--ctp-font-size-xs);
+  font-weight: 600;
+  background: var(--ctp-gray-bg);
+  color: var(--ctp-gray);
+}
+
+.change-task-progress-widget .ctp-badge-state {
+  background: var(--ctp-blue-bg);
+  color: var(--ctp-blue);
+}
+
+.change-task-progress-widget .ctp-priority-1 {
+  background: var(--ctp-red-bg);
+  color: var(--ctp-red);
+}
+
+.change-task-progress-widget .ctp-priority-2 {
+  background: #fff3e0;
+  color: #e65100;
+}
+
+.change-task-progress-widget .ctp-priority-3 {
+  background: var(--ctp-yellow-bg);
+  color: var(--ctp-yellow);
+}
+
+.change-task-progress-widget .ctp-priority-4 {
+  background: var(--ctp-gray-bg);
+  color: var(--ctp-gray);
+}
+
+/* Alert */
+.change-task-progress-widget .ctp-alert {
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-md);
+  padding: var(--ctp-space-md) var(--ctp-space-lg);
+  margin: var(--ctp-space-md) var(--ctp-space-lg) 0;
+  border-radius: var(--ctp-border-radius);
+  border: 1px solid;
+}
+
+.change-task-progress-widget .ctp-alert-danger {
+  background: var(--ctp-red-bg);
+  border-color: var(--ctp-red-light);
+  color: var(--ctp-red);
+}
+
+.change-task-progress-widget .ctp-alert-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.change-task-progress-widget .ctp-alert-body {
+  flex: 1;
+  font-size: var(--ctp-font-size-sm);
+}
+
+.change-task-progress-widget .ctp-alert-dismiss {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  min-width: 44px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--ctp-border-radius);
+  transition: background var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-alert-dismiss:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.change-task-progress-widget .ctp-alert-dismiss:focus {
+  outline: 3px solid var(--ctp-red-light);
+  outline-offset: 2px;
+}
+
+/* Progress Section */
+.change-task-progress-widget .ctp-progress-section {
+  padding: var(--ctp-space-lg);
+}
+
+.change-task-progress-widget .ctp-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-bottom: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-section-title {
+  font-size: var(--ctp-font-size-md);
+  font-weight: 700;
+  margin: 0 0 var(--ctp-space-xs) 0;
+  color: var(--ctp-text-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-sm);
+}
+
+.change-task-progress-widget .ctp-progress-summary {
+  margin: 0;
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-secondary);
+}
+
+.change-task-progress-widget .ctp-progress-percentage {
+  text-align: right;
+}
+
+.change-task-progress-widget .ctp-percentage-value {
+  font-size: var(--ctp-font-size-xl);
+  font-weight: 800;
+  line-height: 1;
+}
+
+.change-task-progress-widget .ctp-progress-green .ctp-percentage-value {
+  color: var(--ctp-green);
+}
+
+.change-task-progress-widget .ctp-progress-yellow .ctp-percentage-value {
+  color: var(--ctp-yellow);
+}
+
+.change-task-progress-widget .ctp-progress-red .ctp-percentage-value {
+  color: var(--ctp-red);
+}
+
+/* Progress Bar */
+.change-task-progress-widget .ctp-progress-bar-container {
+  margin-bottom: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-progress-bar-track {
+  display: flex;
+  height: 28px;
+  background: var(--ctp-bg-tertiary);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.change-task-progress-widget .ctp-progress-segment {
+  height: 100%;
+  transition: width var(--ctp-transition-slow), opacity var(--ctp-transition-fast);
+  cursor: pointer;
+  position: relative;
+  min-width: 0;
+}
+
+.change-task-progress-widget .ctp-progress-segment:hover {
+  opacity: 0.85;
+  filter: brightness(1.1);
+}
+
+.change-task-progress-widget .ctp-progress-segment:focus {
+  outline: 3px solid var(--ctp-blue-light);
+  outline-offset: 2px;
+  z-index: 2;
+}
+
+.change-task-progress-widget .ctp-segment-closed-complete {
+  background: var(--ctp-closed-complete);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 6px,
+    rgba(255, 255, 255, 0.1) 6px,
+    rgba(255, 255, 255, 0.1) 12px
+  );
+}
+
+.change-task-progress-widget .ctp-segment-closed-incomplete {
+  background: var(--ctp-closed-incomplete);
+}
+
+.change-task-progress-widget .ctp-segment-wip {
+  background: var(--ctp-wip);
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 6px,
+    rgba(255, 255, 255, 0.15) 6px,
+    rgba(255, 255, 255, 0.15) 12px
+  );
+}
+
+.change-task-progress-widget .ctp-segment-open {
+  background: var(--ctp-open);
+}
+
+/* Progress Legend */
+.change-task-progress-widget .ctp-progress-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ctp-space-md) var(--ctp-space-lg);
+}
+
+.change-task-progress-widget .ctp-legend-item {
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-sm);
+  cursor: pointer;
+  padding: var(--ctp-space-xs) var(--ctp-space-sm);
+  border-radius: var(--ctp-border-radius);
+  transition: background var(--ctp-transition-fast);
+  min-height: 44px;
+}
+
+.change-task-progress-widget .ctp-legend-item:hover {
+  background: var(--ctp-bg-secondary);
+}
+
+.change-task-progress-widget .ctp-legend-item:focus {
+  outline: 3px solid var(--ctp-blue-light);
+  outline-offset: 2px;
+}
+
+.change-task-progress-widget .ctp-legend-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.change-task-progress-widget .ctp-swatch-closed-complete {
+  background: var(--ctp-closed-complete);
+}
+
+.change-task-progress-widget .ctp-swatch-closed-incomplete {
+  background: var(--ctp-closed-incomplete);
+}
+
+.change-task-progress-widget .ctp-swatch-wip {
+  background: var(--ctp-wip);
+}
+
+.change-task-progress-widget .ctp-swatch-open {
+  background: var(--ctp-open);
+}
+
+.change-task-progress-widget .ctp-legend-label {
+  font-size: var(--ctp-font-size-sm);
+  font-weight: 600;
+  color: var(--ctp-text-primary);
+}
+
+.change-task-progress-widget .ctp-legend-count {
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-muted);
+}
+
+/* Velocity Section */
+.change-task-progress-widget .ctp-velocity-section {
+  padding: 0 var(--ctp-space-lg) var(--ctp-space-lg);
+}
+
+.change-task-progress-widget .ctp-velocity-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-velocity-card {
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-md);
+  padding: var(--ctp-space-md);
+  background: var(--ctp-bg-secondary);
+  border-radius: var(--ctp-border-radius);
+  border: 1px solid var(--ctp-border-color);
+  transition: box-shadow var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-velocity-card:hover {
+  box-shadow: var(--ctp-shadow-sm);
+}
+
+.change-task-progress-widget .ctp-velocity-icon {
+  font-size: 24px;
+  color: var(--ctp-blue);
+  flex-shrink: 0;
+}
+
+.change-task-progress-widget .ctp-velocity-detail {
+  display: flex;
+  flex-direction: column;
+}
+
+.change-task-progress-widget .ctp-velocity-label {
+  font-size: var(--ctp-font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ctp-text-muted);
+  font-weight: 600;
+}
+
+.change-task-progress-widget .ctp-velocity-value {
+  font-size: var(--ctp-font-size-md);
+  font-weight: 700;
+  color: var(--ctp-text-primary);
+}
+
+/* Filters Section */
+.change-task-progress-widget .ctp-filters-section {
+  padding: var(--ctp-space-lg);
+  border-top: 1px solid var(--ctp-border-color);
+}
+
+.change-task-progress-widget .ctp-filters-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ctp-space-md);
+  align-items: flex-end;
+  margin-top: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ctp-space-xs);
+  flex: 1;
+  min-width: 180px;
+}
+
+.change-task-progress-widget .ctp-filter-label {
+  font-size: var(--ctp-font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ctp-text-muted);
+  font-weight: 600;
+  margin: 0;
+}
+
+.change-task-progress-widget .ctp-filter-select {
+  height: 44px;
+  border-radius: var(--ctp-border-radius);
+  border: 1px solid var(--ctp-border-color);
+  font-size: var(--ctp-font-size-base);
+  transition: border-color var(--ctp-transition-fast), box-shadow var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-filter-select:focus {
+  border-color: var(--ctp-blue);
+  box-shadow: 0 0 0 3px rgba(21, 101, 192, 0.25);
+  outline: none;
+}
+
+.change-task-progress-widget .ctp-filter-actions {
+  display: flex;
+  align-items: flex-end;
+  flex: 0;
+  min-width: auto;
+}
+
+/* Task Count Bar */
+.change-task-progress-widget .ctp-task-count-bar {
+  padding: var(--ctp-space-sm) var(--ctp-space-lg);
+  background: var(--ctp-bg-secondary);
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-secondary);
+  border-top: 1px solid var(--ctp-border-color);
+  border-bottom: 1px solid var(--ctp-border-color);
+}
+
+/* Task Table */
+.change-task-progress-widget .ctp-table-responsive {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.change-task-progress-widget .ctp-task-table {
+  width: 100%;
+  margin: 0;
+  border-collapse: collapse;
+}
+
+.change-task-progress-widget .ctp-task-table thead th {
+  background: var(--ctp-bg-secondary);
+  font-size: var(--ctp-font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 700;
+  color: var(--ctp-text-secondary);
+  padding: var(--ctp-space-md);
+  border-bottom: 2px solid var(--ctp-border-color);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.change-task-progress-widget .ctp-th-sortable {
+  cursor: pointer;
+  transition: background var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-th-sortable:hover {
+  background: var(--ctp-bg-tertiary);
+}
+
+.change-task-progress-widget .ctp-th-sortable:focus {
+  outline: 3px solid var(--ctp-blue-light);
+  outline-offset: -3px;
+}
+
+.change-task-progress-widget .ctp-task-table tbody td {
+  padding: var(--ctp-space-md);
+  border-bottom: 1px solid var(--ctp-border-color);
+  font-size: var(--ctp-font-size-sm);
+  vertical-align: middle;
+}
+
+.change-task-progress-widget .ctp-task-row {
+  transition: background var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-task-row:hover {
+  background: var(--ctp-bg-secondary);
+}
+
+.change-task-progress-widget .ctp-task-closed {
+  opacity: 0.7;
+}
+
+.change-task-progress-widget .ctp-td-description {
+  max-width: 280px;
+}
+
+.change-task-progress-widget .ctp-task-link {
+  color: var(--ctp-blue);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-task-link:hover,
+.change-task-progress-widget .ctp-task-link:focus {
+  color: #0d47a1;
+  text-decoration: underline;
+}
+
+/* State Badge */
+.change-task-progress-widget .ctp-state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ctp-space-xs);
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: var(--ctp-font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.change-task-progress-widget .ctp-state-icon {
+  font-size: 10px;
+}
+
+.change-task-progress-widget .ctp-state-open {
+  background: var(--ctp-gray-bg);
+  color: var(--ctp-gray);
+}
+
+.change-task-progress-widget .ctp-state-wip {
+  background: var(--ctp-blue-bg);
+  color: var(--ctp-blue);
+}
+
+.change-task-progress-widget .ctp-state-closed-complete {
+  background: var(--ctp-green-bg);
+  color: var(--ctp-green);
+}
+
+.change-task-progress-widget .ctp-state-closed-incomplete {
+  background: #fff3e0;
+  color: #e65100;
+}
+
+.change-task-progress-widget .ctp-priority-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: var(--ctp-font-size-xs);
+  font-weight: 600;
+}
+
+/* Task Cards (Mobile Only) */
+.change-task-progress-widget .ctp-task-cards {
+  display: none;
+  padding: var(--ctp-space-md);
+  gap: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-task-card {
+  background: var(--ctp-bg-primary);
+  border: 1px solid var(--ctp-border-color);
+  border-radius: var(--ctp-border-radius);
+  overflow: hidden;
+  transition: box-shadow var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-task-card:hover {
+  box-shadow: var(--ctp-shadow-md);
+}
+
+.change-task-progress-widget .ctp-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--ctp-space-md);
+  background: var(--ctp-bg-secondary);
+  border-bottom: 1px solid var(--ctp-border-color);
+}
+
+.change-task-progress-widget .ctp-card-body {
+  padding: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-card-description {
+  margin: 0 0 var(--ctp-space-sm) 0;
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-secondary);
+}
+
+.change-task-progress-widget .ctp-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ctp-space-xs);
+  font-size: var(--ctp-font-size-xs);
+  color: var(--ctp-text-muted);
+}
+
+/* Empty Filter State */
+.change-task-progress-widget .ctp-empty-filter {
+  text-align: center;
+  padding: var(--ctp-space-xxl) var(--ctp-space-lg);
+  color: var(--ctp-text-muted);
+}
+
+.change-task-progress-widget .ctp-empty-filter-icon {
+  font-size: 36px;
+  display: block;
+  margin-bottom: var(--ctp-space-md);
+  color: var(--ctp-gray-light);
+}
+
+/* Workload Section */
+.change-task-progress-widget .ctp-workload-section {
+  padding: var(--ctp-space-lg);
+  border-top: 1px solid var(--ctp-border-color);
+}
+
+.change-task-progress-widget .ctp-workload-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--ctp-space-md);
+  margin-top: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-workload-card {
+  padding: var(--ctp-space-md);
+  background: var(--ctp-bg-secondary);
+  border-radius: var(--ctp-border-radius);
+  border: 1px solid var(--ctp-border-color);
+  transition: box-shadow var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-workload-card:hover {
+  box-shadow: var(--ctp-shadow-sm);
+}
+
+.change-task-progress-widget .ctp-workload-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--ctp-space-sm);
+}
+
+.change-task-progress-widget .ctp-workload-name {
+  font-size: var(--ctp-font-size-sm);
+  font-weight: 700;
+  margin: 0;
+  color: var(--ctp-text-primary);
+}
+
+.change-task-progress-widget .ctp-workload-count {
+  font-size: var(--ctp-font-size-xs);
+  color: var(--ctp-text-muted);
+  font-weight: 600;
+}
+
+.change-task-progress-widget .ctp-workload-bar-track {
+  height: 8px;
+  background: var(--ctp-bg-tertiary);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: var(--ctp-space-sm);
+}
+
+.change-task-progress-widget .ctp-workload-bar-fill {
+  height: 100%;
+  background: var(--ctp-blue);
+  border-radius: 4px;
+  transition: width var(--ctp-transition-slow);
+}
+
+.change-task-progress-widget .ctp-workload-detail {
+  display: flex;
+  gap: var(--ctp-space-md);
+  flex-wrap: wrap;
+}
+
+.change-task-progress-widget .ctp-workload-stat {
+  font-size: var(--ctp-font-size-xs);
+  color: var(--ctp-text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-xs);
+}
+
+.change-task-progress-widget .ctp-workload-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.change-task-progress-widget .ctp-dot-open {
+  background: var(--ctp-open);
+}
+
+.change-task-progress-widget .ctp-dot-wip {
+  background: var(--ctp-wip);
+}
+
+.change-task-progress-widget .ctp-dot-closed {
+  background: var(--ctp-closed-complete);
+}
+
+/* Recent Section */
+.change-task-progress-widget .ctp-recent-section {
+  padding: var(--ctp-space-lg);
+  border-top: 1px solid var(--ctp-border-color);
+}
+
+.change-task-progress-widget .ctp-recent-list {
+  margin-top: var(--ctp-space-md);
+}
+
+.change-task-progress-widget .ctp-recent-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ctp-space-md);
+  padding: var(--ctp-space-md) 0;
+  border-bottom: 1px solid var(--ctp-border-color);
+  transition: background var(--ctp-transition-fast);
+}
+
+.change-task-progress-widget .ctp-recent-item:last-child {
+  border-bottom: none;
+}
+
+.change-task-progress-widget .ctp-recent-item:hover {
+  background: var(--ctp-bg-secondary);
+  margin: 0 calc(-1 * var(--ctp-space-md));
+  padding-left: var(--ctp-space-md);
+  padding-right: var(--ctp-space-md);
+  border-radius: var(--ctp-border-radius);
+}
+
+.change-task-progress-widget .ctp-recent-icon-wrap {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.change-task-progress-widget .ctp-icon-complete {
+  color: var(--ctp-green);
+  font-size: 20px;
+}
+
+.change-task-progress-widget .ctp-icon-incomplete {
+  color: var(--ctp-red);
+  font-size: 20px;
+}
+
+.change-task-progress-widget .ctp-recent-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.change-task-progress-widget .ctp-recent-top {
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-sm);
+  flex-wrap: wrap;
+}
+
+.change-task-progress-widget .ctp-recent-desc {
+  font-size: var(--ctp-font-size-sm);
+  color: var(--ctp-text-secondary);
+}
+
+.change-task-progress-widget .ctp-recent-bottom {
+  display: flex;
+  gap: var(--ctp-space-md);
+  margin-top: var(--ctp-space-xs);
+}
+
+.change-task-progress-widget .ctp-recent-meta {
+  font-size: var(--ctp-font-size-xs);
+  color: var(--ctp-text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--ctp-space-xs);
+}
+
+/* Footer */
+.change-task-progress-widget .ctp-footer {
+  padding: var(--ctp-space-sm) var(--ctp-space-lg);
+  background: var(--ctp-bg-secondary);
+  border-top: 1px solid var(--ctp-border-color);
+  text-align: center;
+}
+
+.change-task-progress-widget .ctp-footer-text {
+  font-size: var(--ctp-font-size-xs);
+  color: var(--ctp-text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ctp-space-sm);
+}
+
+.change-task-progress-widget .ctp-pulse-dot {
+  font-size: 8px;
+  color: var(--ctp-green);
+  animation: ctpPulse 2s ease-in-out infinite;
+}
+
+@keyframes ctpPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ============================
+   Responsive Breakpoints
+   ============================ */
+
+/* Tablet (&lt; 1024px) */
+@media screen and (max-width: 1024px) {
+  .change-task-progress-widget .ctp-velocity-cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .change-task-progress-widget .ctp-workload-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .change-task-progress-widget .ctp-filters-bar {
+    flex-direction: column;
+  }
+
+  .change-task-progress-widget .ctp-filter-group {
+    min-width: 100%;
+  }
+}
+
+/* Mobile (&lt; 768px) */
+@media screen and (max-width: 768px) {
+  .change-task-progress-widget .ctp-header {
+    flex-direction: column;
+    padding: var(--ctp-space-md);
+  }
+
+  .change-task-progress-widget .ctp-header-right {
+    width: 100%;
+  }
+
+  .change-task-progress-widget .ctp-header-actions {
+    justify-content: flex-end;
+  }
+
+  .change-task-progress-widget .ctp-meta-bar {
+    padding: var(--ctp-space-md);
+    gap: var(--ctp-space-md);
+  }
+
+  .change-task-progress-widget .ctp-velocity-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .change-task-progress-widget .ctp-progress-section,
+  .change-task-progress-widget .ctp-filters-section,
+  .change-task-progress-widget .ctp-workload-section,
+  .change-task-progress-widget .ctp-recent-section {
+    padding: var(--ctp-space-md);
+  }
+
+  .change-task-progress-widget .ctp-progress-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--ctp-space-sm);
+  }
+
+  .change-task-progress-widget .ctp-progress-legend {
+    flex-direction: column;
+    gap: var(--ctp-space-sm);
+  }
+
+  .change-task-progress-widget .ctp-workload-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Hide table, show cards on mobile */
+  .change-task-progress-widget .ctp-table-responsive {
+    display: none;
+  }
+
+  .change-task-progress-widget .ctp-task-cards {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .change-task-progress-widget .ctp-progress-bar-track {
+    height: 22px;
+  }
+
+  .change-task-progress-widget .ctp-percentage-value {
+    font-size: var(--ctp-font-size-lg);
+  }
+
+  .change-task-progress-widget .ctp-alert {
+    margin: var(--ctp-space-md);
+    flex-wrap: wrap;
+  }
+}
+
+/* Small Mobile (&lt; 480px) */
+@media screen and (max-width: 480px) {
+  .change-task-progress-widget .ctp-meta-bar {
+    flex-direction: column;
+    gap: var(--ctp-space-sm);
+  }
+
+  .change-task-progress-widget .ctp-meta-item {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--ctp-space-sm);
+  }
+
+  .change-task-progress-widget .ctp-recent-bottom {
+    flex-direction: column;
+    gap: var(--ctp-space-xs);
+  }
+}
+
+/* Print Styles */
+@media print {
+  .change-task-progress-widget {
+    box-shadow: none;
+    border: 1px solid #ccc;
+  }
+
+  .change-task-progress-widget .ctp-header-actions,
+  .change-task-progress-widget .ctp-filters-section,
+  .change-task-progress-widget .ctp-footer,
+  .change-task-progress-widget .ctp-alert-dismiss {
+    display: none;
+  }
+
+  .change-task-progress-widget .ctp-progress-segment {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+}
+
+/* High Contrast Mode */
+@media (forced-colors: active) {
+  .change-task-progress-widget .ctp-progress-segment {
+    border: 2px solid ButtonText;
+  }
+
+  .change-task-progress-widget .ctp-legend-swatch {
+    border: 2px solid ButtonText;
+  }
+}</css>
+<data_table>sp_instance</data_table>
+<demo_data/>
+<description>SERVICENOW SERVICE PORTAL WIDGET REQUIREMENTS SPECIFICATION
+
+WIDGET NAME
+Change Task Progress Widget
+
+PURPOSE
+Provide ITIL users with a visual representation of implementation task completion percenta</description>
+<docs display_value=""/>
+<field_list/>
+<has_preview>true</has_preview>
+<id>change_task_progress_widget_b5f8964e</id>
+<internal>false</internal>
+<link><![CDATA[function link(scope, element, attrs, controller) {  }]]></link>
+<name>Change Task Progress Widget</name>
+<option_schema/>
+<public>true</public>
+<roles/>
+<script><![CDATA[(function() {
+  // ============================================================
+  // Change Task Progress Widget — Server Script
+  // ============================================================
+
+  // Get Change Request sys_id from options, URL params, or input
+  var changeSysId =  '64ae2a0f93cff61013b7326efaba1028' || $sp.getParameter('sys_id'); //Hardcode test sys_id
+  if (options && options.change_sys_id) {
+    changeSysId = options.change_sys_id;
+  }
+  if (input && input.change_sys_id) {
+    changeSysId = input.change_sys_id;
+  }
+
+  // Initialize data object
+  data.changeRequest = {};
+  data.tasks = [];
+  data.stats = {
+    total: 0,
+    open: 0,
+    wip: 0,
+    closedComplete: 0,
+    closedIncomplete: 0,
+    remaining: 0,
+    completionPercentage: 0,
+    openPercent: 0,
+    wipPercent: 0,
+    closedCompletePercent: 0,
+    closedIncompletePercent: 0
+  };
+  data.velocity = {
+    avgClosureRate: 0,
+    estimatedCompletion: null,
+    daysRemaining: null
+  };
+  data.assignmentGroups = [];
+  data.recentlyClosed = [];
+  data.thresholdAlert = { active: false, message: '' };
+  data.error = null;
+
+  // Widget options with defaults
+  data.options = {
+    threshold: (options && options.threshold) ? parseInt(options.threshold) : 50,
+    autoRefresh: (options && options.auto_refresh) ? true : false,
+    refreshInterval: (options && options.refresh_interval) ? parseInt(options.refresh_interval) : 60
+  };
+
+  // ============================================================
+  // Handle refresh action from client
+  // ============================================================
+  if (input && input.action === 'refresh') {
+    changeSysId = input.change_sys_id || changeSysId;
+  }
+
+  // ============================================================
+  // Validate and fetch Change Request
+  // ============================================================
+  if (!changeSysId) {
+    // Try to find by number parameter
+    var changeNumber = $sp.getParameter('number') || '';
+    if (changeNumber) {
+      var grLookup = new GlideRecord('change_request');
+      grLookup.addQuery('number', changeNumber);
+      grLookup.setLimit(1);
+      grLookup.query();
+      if (grLookup.next()) {
+        changeSysId = grLookup.getUniqueValue();
+      }
+    }
+  }
+
+  if (!changeSysId) {
+    data.error = null; // No error, just no CR specified
+    return;
+  }
+
+  // ============================================================
+  // 1. Retrieve Change Request Record
+  // ============================================================
+  var grChange = new GlideRecord('change_request');
+  if (grChange.get(changeSysId)) {
+    data.changeRequest = {
+      sys_id: grChange.getUniqueValue(),
+      number: grChange.getValue('number') || '',
+      short_description: grChange.getValue('short_description') || '',
+      state: grChange.getValue('state') || '',
+      state_display: grChange.getDisplayValue('state') || '',
+      priority: grChange.getValue('priority') || '',
+      priority_display: grChange.getDisplayValue('priority') || '',
+      risk: grChange.getValue('risk') || '',
+      risk_display: grChange.getDisplayValue('risk') || '',
+      start_date: grChange.getDisplayValue('start_date') || '',
+      end_date: grChange.getDisplayValue('end_date') || '',
+      assignment_group: grChange.getValue('assignment_group') || '',
+      assignment_group_display: grChange.getDisplayValue('assignment_group') || '',
+      assigned_to: grChange.getValue('assigned_to') || '',
+      assigned_to_display: grChange.getDisplayValue('assigned_to') || '',
+      close_code: grChange.getValue('close_code') || ''
+    };
+  } else {
+    data.error = 'Change Request not found. Please verify the record exists and you have access.';
+    return;
+  }
+
+  // ============================================================
+  // 2. Aggregate Task Counts by State using GlideAggregate
+  // ============================================================
+  var stateCounts = {};
+  var totalTasks = 0;
+
+  var gaState = new GlideAggregate('change_task');
+  gaState.addQuery('change_request', changeSysId);
+  gaState.addAggregate('COUNT');
+  gaState.groupBy('state');
+  gaState.query();
+
+  while (gaState.next()) {
+    var stateVal = gaState.getValue('state');
+    var count = parseInt(gaState.getAggregate('COUNT')) || 0;
+    stateCounts[stateVal] = count;
+    totalTasks += count;
+  }
+
+  // Map state counts
+  var openCount = stateCounts['1'] || 0;       // Open
+  var wipCount = stateCounts['2'] || 0;        // Work in Progress
+  var closedCompleteCount = stateCounts['3'] || 0;   // Closed Complete
+  var closedIncompleteCount = stateCounts['4'] || 0; // Closed Incomplete
+
+  // Calculate percentages (handle division by zero)
+  var completionPercentage = 0;
+  var openPercent = 0;
+  var wipPercent = 0;
+  var closedCompletePercent = 0;
+  var closedIncompletePercent = 0;
+
+  if (totalTasks > 0) {
+    completionPercentage = Math.round((closedCompleteCount / totalTasks) * 100);
+    openPercent = Math.round((openCount / totalTasks) * 100);
+    wipPercent = Math.round((wipCount / totalTasks) * 100);
+    closedCompletePercent = Math.round((closedCompleteCount / totalTasks) * 100);
+    closedIncompletePercent = Math.round((closedIncompleteCount / totalTasks) * 100);
+
+    // Ensure percentages sum to 100 by adjusting the largest segment
+    var percentSum = openPercent + wipPercent + closedCompletePercent + closedIncompletePercent;
+    if (percentSum !== 100 && totalTasks > 0) {
+      var diff = 100 - percentSum;
+      // Add the difference to the largest segment
+      var maxSeg = Math.max(openPercent, wipPercent, closedCompletePercent, closedIncompletePercent);
+      if (closedCompletePercent === maxSeg) closedCompletePercent += diff;
+      else if (openPercent === maxSeg) openPercent += diff;
+      else if (wipPercent === maxSeg) wipPercent += diff;
+      else closedIncompletePercent += diff;
+    }
+  }
+
+  var remainingTasks = openCount + wipCount;
+
+  data.stats = {
+    total: totalTasks,
+    open: openCount,
+    wip: wipCount,
+    closedComplete: closedCompleteCount,
+    closedIncomplete: closedIncompleteCount,
+    remaining: remainingTasks,
+    completionPercentage: completionPercentage,
+    openPercent: openPercent,
+    wipPercent: wipPercent,
+    closedCompletePercent: closedCompletePercent,
+    closedIncompletePercent: closedIncompletePercent
+  };
+
+  // ============================================================
+  // 3. Retrieve All Change Task Records with Details
+  // ============================================================
+  var userCache = {};
+  var groupCache = {};
+
+  function getUserName(userSysId) {
+    if (!userSysId) return '';
+    if (userCache[userSysId]) return userCache[userSysId];
+
+    var grUser = new GlideRecord('sys_user');
+    if (grUser.get(userSysId)) {
+      userCache[userSysId] = grUser.getValue('name') || '';
+      return userCache[userSysId];
+    }
+    userCache[userSysId] = '';
+    return '';
+  }
+
+  function getGroupName(groupSysId) {
+    if (!groupSysId) return '';
+    if (groupCache[groupSysId]) return groupCache[groupSysId];
+
+    var grGroup = new GlideRecord('sys_user_group');
+    if (grGroup.get(groupSysId)) {
+      groupCache[groupSysId] = grGroup.getValue('name') || '';
+      return groupCache[groupSysId];
+    }
+    groupCache[groupSysId] = '';
+    return '';
+  }
+
+  var tasks = [];
+  var grTask = new GlideRecord('change_task');
+  grTask.addQuery('change_request', changeSysId);
+  grTask.orderBy('order');
+  grTask.orderBy('number');
+  grTask.query();
+
+  while (grTask.next()) {
+    var assignedToSysId = grTask.getValue('assigned_to') || '';
+    var assignmentGroupSysId = grTask.getValue('assignment_group') || '';
+
+    var taskObj = {
+      sys_id: grTask.getUniqueValue(),
+      number: grTask.getValue('number') || '',
+      short_description: grTask.getValue('short_description') || '',
+      state: grTask.getValue('state') || '',
+      state_display: grTask.getDisplayValue('state') || '',
+      priority: grTask.getValue('priority') || '',
+      priority_display: grTask.getDisplayValue('priority') || '',
+      assignment_group: assignmentGroupSysId,
+      assignment_group_display: grTask.getDisplayValue('assignment_group') || '',
+      assigned_to: assignedToSysId,
+      assigned_to_display: grTask.getDisplayValue('assigned_to') || '',
+      opened_at: grTask.getDisplayValue('opened_at') || '',
+      closed_at: grTask.getDisplayValue('closed_at') || '',
+      close_code: grTask.getValue('close_code') || '',
+      order: parseInt(grTask.getValue('order')) || 0,
+      type: grTask.getValue('type') || '',
+      type_display: grTask.getDisplayValue('type') || ''
+    };
+
+    tasks.push(taskObj);
+  }
+
+  data.tasks = tasks;
+
+  // ============================================================
+  // 4. Workload Distribution by Assignment Group using GlideAggregate
+  // ============================================================
+  var groupAggData = {};
+
+  var gaGroup = new GlideAggregate('change_task');
+  gaGroup.addQuery('change_request', changeSysId);
+  gaGroup.addAggregate('COUNT');
+  gaGroup.groupBy('assignment_group');
+  gaGroup.query();
+
+  while (gaGroup.next()) {
+    var grpSysId = gaGroup.getValue('assignment_group') || '';
+    var grpCount = parseInt(gaGroup.getAggregate('COUNT')) || 0;
+
+    if (grpSysId) {
+      groupAggData[grpSysId] = {
+        sys_id: grpSysId,
+        name: getGroupName(grpSysId),
+        taskCount: grpCount,
+        percentage: totalTasks > 0 ? Math.round((grpCount / totalTasks) * 100) : 0,
+        openCount: 0,
+        wipCount: 0,
+        closedCount: 0
+      };
+    }
+  }
+
+  // Get state breakdown per group
+  var gaGroupState = new GlideAggregate('change_task');
+  gaGroupState.addQuery('change_request', changeSysId);
+  gaGroupState.addNotNullQuery('assignment_group');
+  gaGroupState.addAggregate('COUNT');
+  gaGroupState.groupBy('assignment_group');
+  gaGroupState.groupBy('state');
+  gaGroupState.query();
+
+  while (gaGroupState.next()) {
+    var gsGrpId = gaGroupState.getValue('assignment_group') || '';
+    var gsState = gaGroupState.getValue('state');
+    var gsCount = parseInt(gaGroupState.getAggregate('COUNT')) || 0;
+
+    if (gsGrpId && groupAggData[gsGrpId]) {
+      if (gsState === '1') groupAggData[gsGrpId].openCount += gsCount;
+      else if (gsState === '2') groupAggData[gsGrpId].wipCount += gsCount;
+      else if (gsState === '3' || gsState === '4') groupAggData[gsGrpId].closedCount += gsCount;
+    }
+  }
+
+  // Convert to array and sort by task count descending
+  var assignmentGroups = [];
+  for (var gid in groupAggData) {
+    if (groupAggData.hasOwnProperty(gid)) {
+      assignmentGroups.push(groupAggData[gid]);
+    }
+  }
+  assignmentGroups.sort(function(a, b) {
+    return b.taskCount - a.taskCount;
+  });
+
+  data.assignmentGroups = assignmentGroups;
+
+  // ============================================================
+  // 5. Calculate Estimated Completion Date (Velocity)
+  // ============================================================
+  var closedTasks = [];
+  var grClosed = new GlideRecord('change_task');
+  grClosed.addQuery('change_request', changeSysId);
+  grClosed.addQuery('state', 'IN', '3,4');
+  grClosed.addNotNullQuery('closed_at');
+  grClosed.addNotNullQuery('opened_at');
+  grClosed.orderByDesc('closed_at');
+  grClosed.query();
+
+  var closureDurations = []; // in days
+  var earliestOpen = null;
+  var latestClose = null;
+
+  while (grClosed.next()) {
+    var openedGdt = new GlideDateTime(grClosed.getValue('opened_at'));
+    var closedGdt = new GlideDateTime(grClosed.getValue('closed_at'));
+
+    var durationMs = GlideDateTime.subtract(openedGdt, closedGdt).getNumericValue();
+    var durationDays = durationMs / (1000 * 60 * 60 * 24);
+    if (durationDays > 0) {
+      closureDurations.push(durationDays);
+    }
+
+    if (!earliestOpen || openedGdt.compareTo(earliestOpen) < 0) {
+      earliestOpen = new GlideDateTime(openedGdt);
+    }
+    if (!latestClose || closedGdt.compareTo(latestClose) > 0) {
+      latestClose = new GlideDateTime(closedGdt);
+    }
+  }
+
+  var avgClosureRate = 0;
+  var estimatedCompletion = null;
+  var daysRemaining = null;
+
+  var totalClosed = closedCompleteCount + closedIncompleteCount;
+
+  if (totalClosed > 0 && earliestOpen && latestClose) {
+    // Calculate actual elapsed days for all closed tasks
+    var elapsedMs = GlideDateTime.subtract(earliestOpen, latestClose).getNumericValue();
+    var elapsedDays = elapsedMs / (1000 * 60 * 60 * 24);
+
+    if (elapsedDays > 0) {
+      avgClosureRate = Math.round((totalClosed / elapsedDays) * 100) / 100;
+
+      if (remainingTasks > 0 && avgClosureRate > 0) {
+        daysRemaining = Math.ceil(remainingTasks / avgClosureRate);
+
+        var estDate = new GlideDateTime();
+        estDate.addDaysLocalTime(daysRemaining);
+        estimatedCompletion = estDate.getDisplayValue().split(' ')[0]; // Date portion only
+      } else if (remainingTasks === 0) {
+        daysRemaining = 0;
+        estimatedCompletion = 'Complete';
+      }
+    }
+  } else if (remainingTasks === 0 && totalTasks > 0) {
+    avgClosureRate = 0;
+    daysRemaining = 0;
+    estimatedCompletion = 'Complete';
+  }
+
+  data.velocity = {
+    avgClosureRate: avgClosureRate,
+    estimatedCompletion: estimatedCompletion,
+    daysRemaining: daysRemaining
+  };
+
+  // ============================================================
+  // 6. Recently Closed Tasks (Last 5)
+  // ============================================================
+  var recentlyClosed = [];
+  var grRecent = new GlideRecord('change_task');
+  grRecent.addQuery('change_request', changeSysId);
+  grRecent.addQuery('state', 'IN', '3,4');
+  grRecent.orderByDesc('closed_at');
+  grRecent.setLimit(5);
+  grRecent.query();
+
+  while (grRecent.next()) {
+    var closedBySysId = grRecent.getValue('assigned_to') || '';
+
+    recentlyClosed.push({
+      sys_id: grRecent.getUniqueValue(),
+      number: grRecent.getValue('number') || '',
+      short_description: grRecent.getValue('short_description') || '',
+      state: grRecent.getValue('state') || '',
+      state_display: grRecent.getDisplayValue('state') || '',
+      closed_at: grRecent.getDisplayValue('closed_at') || '',
+      close_code: grRecent.getDisplayValue('close_code') || '',
+      closed_by_display: closedBySysId ? getUserName(closedBySysId) : 'System'
+    });
+  }
+
+  data.recentlyClosed = recentlyClosed;
+
+  // ============================================================
+  // 7. Threshold Alert Check
+  // ============================================================
+  var thresholdValue = data.options.threshold;
+
+  if (totalTasks > 0) {
+    // Check if change has an end date that is approaching or passed
+    var changeEndDate = grChange.getValue('end_date');
+    if (changeEndDate) {
+      var endGdt = new GlideDateTime(changeEndDate);
+      var nowGdt = new GlideDateTime();
+
+      var timeToEnd = GlideDateTime.subtract(nowGdt, endGdt).getNumericValue();
+      var daysToEnd = timeToEnd / (1000 * 60 * 60 * 24);
+
+      // If end date has passed and tasks remain
+      if (daysToEnd < 0 && remainingTasks > 0) {
+        data.thresholdAlert = {
+          active: true,
+          message: 'The planned end date has passed with ' + remainingTasks + ' task(s) still pending completion. Current completion is at ' + completionPercentage + '%.'
+        };
+      }
+      // If less than 2 days remain and completion below threshold
+      else if (daysToEnd <= 2 && daysToEnd >= 0 && completionPercentage < thresholdValue) {
+        data.thresholdAlert = {
+          active: true,
+          message: 'Only ' + Math.ceil(daysToEnd) + ' day(s) remain until the planned end date, but completion is only at ' + completionPercentage + '% (threshold: ' + thresholdValue + '%).'
+        };
+      }
+      // General threshold check
+      else if (completionPercentage < thresholdValue && daysToEnd <= 7 && daysToEnd >= 0) {
+        data.thresholdAlert = {
+          active: true,
+          message: 'Progress at ' + completionPercentage + '% is below the expected threshold of ' + thresholdValue + '% with ' + Math.ceil(daysToEnd) + ' day(s) remaining.'
+        };
+      }
+    }
+    // No end date — simple threshold check based on having many open tasks
+    else if (completionPercentage < thresholdValue && totalTasks >= 5) {
+      data.thresholdAlert = {
+        active: true,
+        message: 'Task completion is at ' + completionPercentage + '%, which is below the configured threshold of ' + thresholdValue + '%. ' + remainingTasks + ' task(s) remain.'
+      };
+    }
+  }
+
+})();]]></script>
+<servicenow>false</servicenow>
+<sys_class_name>sp_widget</sys_class_name>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-02-18 16:32:22</sys_created_on>
+<sys_id>f83e66cb93cff61013b7326efaba1000</sys_id>
+<sys_mod_count>5</sys_mod_count>
+<sys_name>Change Task Progress Widget</sys_name>
+<sys_package display_value="Global" source="global">global</sys_package>
+<sys_policy/>
+<sys_scope display_value="Global">global</sys_scope>
+<sys_update_name>sp_widget_f83e66cb93cff61013b7326efaba1000</sys_update_name>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-02-18 16:48:35</sys_updated_on>
+<template><![CDATA[<div class="change-task-progress-widget" 
+     role="region" 
+     aria-label="Change Task Progress for {{c.data.changeRequest.number}}"
+     ng-class="{'is-loading': c.loading, 'has-error': c.error}">
+  
+  <!-- Loading Overlay -->
+  <div class="ctp-loading-overlay" ng-if="c.loading" aria-live="polite" aria-busy="true">
+    <div class="ctp-spinner">
+      <span class="fa fa-spinner fa-spin fa-3x" aria-hidden="true"></span>
+      <span class="sr-only">Loading change task progress data...</span>
+    </div>
+  </div>
+
+  <!-- Error State -->
+  <div class="ctp-error-state" ng-if="c.error && !c.loading" role="alert">
+    <div class="ctp-error-content">
+      <span class="fa fa-exclamation-triangle ctp-error-icon" aria-hidden="true"></span>
+      <h3 class="ctp-error-title">Unable to Load Progress Data</h3>
+      <p class="ctp-error-message">{{c.error}}</p>
+      <button class="btn btn-primary ctp-btn" ng-click="c.refreshData()" aria-label="Retry loading data">
+        <span class="fa fa-refresh" aria-hidden="true"></span> Retry
+      </button>
+    </div>
+  </div>
+
+  <!-- Empty State -->
+  <div class="ctp-empty-state" ng-if="!c.loading && !c.error && !c.data.changeRequest.sys_id" role="status">
+    <div class="ctp-empty-content">
+      <span class="fa fa-info-circle ctp-empty-icon" aria-hidden="true"></span>
+      <h3 class="ctp-empty-title">No Change Request Found</h3>
+      <p class="ctp-empty-message">Please provide a valid Change Request sys_id or number.</p>
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="ctp-main" ng-if="!c.loading && !c.error && c.data.changeRequest.sys_id">
+    
+    <!-- Header Section -->
+    <div class="ctp-header">
+      <div class="ctp-header-left">
+        <h2 class="ctp-title">
+          <span class="fa fa-tasks ctp-title-icon" aria-hidden="true"></span>
+          Change Task Progress
+        </h2>
+        <p class="ctp-subtitle">
+          <a href="?id=form&table=change_request&sys_id={{c.data.changeRequest.sys_id}}" 
+             class="ctp-change-link" 
+             title="Open {{c.data.changeRequest.number}}">
+            {{c.data.changeRequest.number}}
+          </a>
+          <span class="ctp-separator" aria-hidden="true">—</span>
+          <span class="ctp-description">{{c.data.changeRequest.short_description}}</span>
+        </p>
+      </div>
+      <div class="ctp-header-right">
+        <div class="ctp-header-actions">
+          <button class="btn btn-default ctp-btn ctp-btn-icon" 
+                  ng-click="c.refreshData()" 
+                  aria-label="Refresh progress data"
+                  title="Refresh">
+            <span class="fa fa-refresh" ng-class="{'fa-spin': c.refreshing}" aria-hidden="true"></span>
+          </button>
+          <div class="btn-group ctp-export-group" uib-dropdown>
+            <button class="btn btn-default ctp-btn ctp-btn-icon" 
+                    uib-dropdown-toggle 
+                    aria-label="Export options"
+                    title="Export">
+              <span class="fa fa-download" aria-hidden="true"></span>
+              <span class="caret" aria-hidden="true"></span>
+            </button>
+            <ul class="dropdown-menu dropdown-menu-right" uib-dropdown-menu role="menu">
+              <li role="menuitem">
+                <a href="javascript:void(0)" ng-click="c.exportData('pdf')">
+                  <span class="fa fa-file-pdf-o" aria-hidden="true"></span> Export as PDF
+                </a>
+              </li>
+              <li role="menuitem">
+                <a href="javascript:void(0)" ng-click="c.exportData('excel')">
+                  <span class="fa fa-file-excel-o" aria-hidden="true"></span> Export as Excel
+                </a>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Change Request Meta -->
+    <div class="ctp-meta-bar">
+      <div class="ctp-meta-item">
+        <span class="ctp-meta-label">State</span>
+        <span class="ctp-badge ctp-badge-state" ng-class="c.getChangeStateBadgeClass()">
+          {{c.data.changeRequest.state_display}}
+        </span>
+      </div>
+      <div class="ctp-meta-item">
+        <span class="ctp-meta-label">Priority</span>
+        <span class="ctp-badge ctp-badge-priority" ng-class="'ctp-priority-' + c.data.changeRequest.priority">
+          {{c.data.changeRequest.priority_display}}
+        </span>
+      </div>
+      <div class="ctp-meta-item">
+        <span class="ctp-meta-label">Risk</span>
+        <span class="ctp-badge">{{c.data.changeRequest.risk_display}}</span>
+      </div>
+      <div class="ctp-meta-item">
+        <span class="ctp-meta-label">Planned Start</span>
+        <span>{{c.data.changeRequest.start_date || 'N/A'}}</span>
+      </div>
+      <div class="ctp-meta-item">
+        <span class="ctp-meta-label">Planned End</span>
+        <span>{{c.data.changeRequest.end_date || 'N/A'}}</span>
+      </div>
+    </div>
+
+    <!-- Threshold Alert -->
+    <div class="ctp-alert ctp-alert-danger" 
+         role="alert" 
+         ng-if="c.data.thresholdAlert && c.data.thresholdAlert.active">
+      <span class="fa fa-exclamation-circle ctp-alert-icon" aria-hidden="true"></span>
+      <div class="ctp-alert-body">
+        <strong>Progress Alert:</strong> {{c.data.thresholdAlert.message}}
+      </div>
+      <button class="ctp-alert-dismiss" 
+              ng-click="c.dismissAlert()" 
+              aria-label="Dismiss alert">
+        <span class="fa fa-times" aria-hidden="true"></span>
+      </button>
+    </div>
+
+    <!-- Overall Progress Section -->
+    <div class="ctp-progress-section">
+      <div class="ctp-progress-header">
+        <div class="ctp-progress-info">
+          <h3 class="ctp-section-title">Overall Completion</h3>
+          <p class="ctp-progress-summary" aria-live="polite">
+            <strong>{{c.data.stats.closedComplete}}</strong> of <strong>{{c.data.stats.total}}</strong> tasks completed
+          </p>
+        </div>
+        <div class="ctp-progress-percentage" ng-class="c.getProgressColorClass()">
+          <span class="ctp-percentage-value">{{c.data.stats.completionPercentage}}%</span>
+        </div>
+      </div>
+
+      <!-- Stacked Progress Bar -->
+      <div class="ctp-progress-bar-container" 
+           role="progressbar" 
+           aria-valuenow="{{c.data.stats.completionPercentage}}" 
+           aria-valuemin="0" 
+           aria-valuemax="100"
+           aria-label="Task completion progress: {{c.data.stats.completionPercentage}}% complete">
+        <div class="ctp-progress-bar-track">
+          <div class="ctp-progress-segment ctp-segment-closed-complete" 
+               ng-style="{'width': c.data.stats.closedCompletePercent + '%'}"
+               ng-click="c.onSegmentClick('3')"
+               tabindex="0"
+               role="button"
+               aria-label="Closed Complete: {{c.data.stats.closedComplete}} tasks ({{c.data.stats.closedCompletePercent}}%)"
+               ng-keydown="c.handleSegmentKeydown($event, '3')"
+               title="Closed Complete: {{c.data.stats.closedComplete}} tasks">
+          </div>
+          <div class="ctp-progress-segment ctp-segment-closed-incomplete" 
+               ng-style="{'width': c.data.stats.closedIncompletePercent + '%'}"
+               ng-click="c.onSegmentClick('4')"
+               tabindex="0"
+               role="button"
+               aria-label="Closed Incomplete: {{c.data.stats.closedIncomplete}} tasks ({{c.data.stats.closedIncompletePercent}}%)"
+               ng-keydown="c.handleSegmentKeydown($event, '4')"
+               title="Closed Incomplete: {{c.data.stats.closedIncomplete}} tasks">
+          </div>
+          <div class="ctp-progress-segment ctp-segment-wip" 
+               ng-style="{'width': c.data.stats.wipPercent + '%'}"
+               ng-click="c.onSegmentClick('2')"
+               tabindex="0"
+               role="button"
+               aria-label="Work in Progress: {{c.data.stats.wip}} tasks ({{c.data.stats.wipPercent}}%)"
+               ng-keydown="c.handleSegmentKeydown($event, '2')"
+               title="Work in Progress: {{c.data.stats.wip}} tasks">
+          </div>
+          <div class="ctp-progress-segment ctp-segment-open" 
+               ng-style="{'width': c.data.stats.openPercent + '%'}"
+               ng-click="c.onSegmentClick('1')"
+               tabindex="0"
+               role="button"
+               aria-label="Open: {{c.data.stats.open}} tasks ({{c.data.stats.openPercent}}%)"
+               ng-keydown="c.handleSegmentKeydown($event, '1')"
+               title="Open: {{c.data.stats.open}} tasks">
+          </div>
+        </div>
+      </div>
+
+      <!-- Progress Legend -->
+      <div class="ctp-progress-legend" role="list" aria-label="Task state legend">
+        <div class="ctp-legend-item" role="listitem" ng-click="c.onSegmentClick('3')" tabindex="0"
+             ng-keydown="c.handleSegmentKeydown($event, '3')">
+          <span class="ctp-legend-swatch ctp-swatch-closed-complete" aria-hidden="true">✓</span>
+          <span class="ctp-legend-label">Closed Complete</span>
+          <span class="ctp-legend-count">{{c.data.stats.closedComplete}} ({{c.data.stats.closedCompletePercent}}%)</span>
+        </div>
+        <div class="ctp-legend-item" role="listitem" ng-click="c.onSegmentClick('4')" tabindex="0"
+             ng-keydown="c.handleSegmentKeydown($event, '4')">
+          <span class="ctp-legend-swatch ctp-swatch-closed-incomplete" aria-hidden="true">✕</span>
+          <span class="ctp-legend-label">Closed Incomplete</span>
+          <span class="ctp-legend-count">{{c.data.stats.closedIncomplete}} ({{c.data.stats.closedIncompletePercent}}%)</span>
+        </div>
+        <div class="ctp-legend-item" role="listitem" ng-click="c.onSegmentClick('2')" tabindex="0"
+             ng-keydown="c.handleSegmentKeydown($event, '2')">
+          <span class="ctp-legend-swatch ctp-swatch-wip" aria-hidden="true">⟳</span>
+          <span class="ctp-legend-label">Work in Progress</span>
+          <span class="ctp-legend-count">{{c.data.stats.wip}} ({{c.data.stats.wipPercent}}%)</span>
+        </div>
+        <div class="ctp-legend-item" role="listitem" ng-click="c.onSegmentClick('1')" tabindex="0"
+             ng-keydown="c.handleSegmentKeydown($event, '1')">
+          <span class="ctp-legend-swatch ctp-swatch-open" aria-hidden="true">○</span>
+          <span class="ctp-legend-label">Open</span>
+          <span class="ctp-legend-count">{{c.data.stats.open}} ({{c.data.stats.openPercent}}%)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Estimated Completion & Velocity -->
+    <div class="ctp-velocity-section" ng-if="c.data.velocity">
+      <div class="ctp-velocity-cards">
+        <div class="ctp-velocity-card">
+          <span class="fa fa-calendar-check-o ctp-velocity-icon" aria-hidden="true"></span>
+          <div class="ctp-velocity-detail">
+            <span class="ctp-velocity-label">Est. Completion</span>
+            <span class="ctp-velocity-value">{{c.data.velocity.estimatedCompletion || 'N/A'}}</span>
+          </div>
+        </div>
+        <div class="ctp-velocity-card">
+          <span class="fa fa-tachometer ctp-velocity-icon" aria-hidden="true"></span>
+          <div class="ctp-velocity-detail">
+            <span class="ctp-velocity-label">Avg. Closure Rate</span>
+            <span class="ctp-velocity-value">{{c.data.velocity.avgClosureRate}} tasks/day</span>
+          </div>
+        </div>
+        <div class="ctp-velocity-card">
+          <span class="fa fa-clock-o ctp-velocity-icon" aria-hidden="true"></span>
+          <div class="ctp-velocity-detail">
+            <span class="ctp-velocity-label">Remaining Tasks</span>
+            <span class="ctp-velocity-value">{{c.data.stats.remaining}}</span>
+          </div>
+        </div>
+        <div class="ctp-velocity-card">
+          <span class="fa fa-line-chart ctp-velocity-icon" aria-hidden="true"></span>
+          <div class="ctp-velocity-detail">
+            <span class="ctp-velocity-label">Days Remaining</span>
+            <span class="ctp-velocity-value">{{c.data.velocity.daysRemaining || 'N/A'}}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Filters Section -->
+    <div class="ctp-filters-section">
+      <h3 class="ctp-section-title">
+        <span class="fa fa-filter" aria-hidden="true"></span> Task Details
+      </h3>
+      <div class="ctp-filters-bar" role="search" aria-label="Filter change tasks">
+        <div class="ctp-filter-group">
+          <label for="ctp-filter-group-{{::$id}}" class="ctp-filter-label">Assignment Group</label>
+          <select id="ctp-filter-group-{{::$id}}" 
+                  class="form-control ctp-filter-select" 
+                  ng-model="c.filters.assignmentGroup"
+                  ng-change="c.applyFilters()"
+                  aria-label="Filter by assignment group">
+            <option value="">All Groups</option>
+            <option ng-repeat="group in c.data.assignmentGroups" value="{{group.sys_id}}">
+              {{group.name}} ({{group.taskCount}})
+            </option>
+          </select>
+        </div>
+        <div class="ctp-filter-group">
+          <label for="ctp-filter-priority-{{::$id}}" class="ctp-filter-label">Priority</label>
+          <select id="ctp-filter-priority-{{::$id}}" 
+                  class="form-control ctp-filter-select" 
+                  ng-model="c.filters.priority"
+                  ng-change="c.applyFilters()"
+                  aria-label="Filter by priority">
+            <option value="">All Priorities</option>
+            <option value="1">1 - Critical</option>
+            <option value="2">2 - High</option>
+            <option value="3">3 - Moderate</option>
+            <option value="4">4 - Low</option>
+          </select>
+        </div>
+        <div class="ctp-filter-group">
+          <label for="ctp-filter-state-{{::$id}}" class="ctp-filter-label">State</label>
+          <select id="ctp-filter-state-{{::$id}}" 
+                  class="form-control ctp-filter-select" 
+                  ng-model="c.filters.state"
+                  ng-change="c.applyFilters()"
+                  aria-label="Filter by state">
+            <option value="">All States</option>
+            <option value="1">Open</option>
+            <option value="2">Work in Progress</option>
+            <option value="3">Closed Complete</option>
+            <option value="4">Closed Incomplete</option>
+          </select>
+        </div>
+        <div class="ctp-filter-group ctp-filter-actions">
+          <button class="btn btn-link ctp-btn ctp-btn-clear" 
+                  ng-click="c.clearFilters()" 
+                  ng-if="c.hasActiveFilters()"
+                  aria-label="Clear all filters">
+            <span class="fa fa-times-circle" aria-hidden="true"></span> Clear Filters
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Task List / Drill-Down -->
+    <div class="ctp-task-list-section" aria-live="polite">
+      <div class="ctp-task-count-bar" ng-if="c.filteredTasks.length > 0">
+        <span>Showing <strong>{{c.filteredTasks.length}}</strong> of <strong>{{c.data.tasks.length}}</strong> tasks</span>
+      </div>
+
+      <!-- Tasks Table (Desktop) -->
+      <div class="ctp-table-responsive" ng-if="c.filteredTasks.length > 0">
+        <table class="table ctp-task-table" role="grid" aria-label="Change tasks">
+          <thead>
+            <tr>
+              <th scope="col" class="ctp-th-sortable" ng-click="c.sortTasks('number')" 
+                  tabindex="0" ng-keydown="c.handleSortKeydown($event, 'number')">
+                Number 
+                <span class="fa" ng-class="c.getSortIcon('number')" aria-hidden="true"></span>
+              </th>
+              <th scope="col" class="ctp-th-sortable" ng-click="c.sortTasks('short_description')"
+                  tabindex="0" ng-keydown="c.handleSortKeydown($event, 'short_description')">
+                Description
+                <span class="fa" ng-class="c.getSortIcon('short_description')" aria-hidden="true"></span>
+              </th>
+              <th scope="col">State</th>
+              <th scope="col">Priority</th>
+              <th scope="col">Assignment Group</th>
+              <th scope="col">Assigned To</th>
+              <th scope="col" class="ctp-th-sortable" ng-click="c.sortTasks('opened_at')"
+                  tabindex="0" ng-keydown="c.handleSortKeydown($event, 'opened_at')">
+                Opened
+                <span class="fa" ng-class="c.getSortIcon('opened_at')" aria-hidden="true"></span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr ng-repeat="task in c.filteredTasks track by task.sys_id" 
+                class="ctp-task-row"
+                ng-class="{'ctp-task-closed': task.state == '3' || task.state == '4'}">
+              <td data-label="Number">
+                <a href="?id=form&table=change_task&sys_id={{task.sys_id}}" 
+                   class="ctp-task-link" title="Open {{task.number}}">
+                  {{task.number}}
+                </a>
+              </td>
+              <td data-label="Description" class="ctp-td-description">
+                {{task.short_description | limitTo: 80}}{{task.short_description.length > 80 ? '...' : ''}}
+              </td>
+              <td data-label="State">
+                <span class="ctp-state-badge" ng-class="c.getStateBadgeClass(task.state)">
+                  <span class="ctp-state-icon" aria-hidden="true">{{c.getStateIcon(task.state)}}</span>
+                  {{c.getStateLabel(task.state)}}
+                </span>
+              </td>
+              <td data-label="Priority">
+                <span class="ctp-priority-badge" ng-class="'ctp-priority-' + task.priority">
+                  {{task.priority_display}}
+                </span>
+              </td>
+              <td data-label="Assignment Group">{{task.assignment_group_display || 'Unassigned'}}</td>
+              <td data-label="Assigned To">{{task.assigned_to_display || 'Unassigned'}}</td>
+              <td data-label="Opened">{{task.opened_at}}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Task Cards (Mobile) -->
+      <div class="ctp-task-cards" ng-if="c.filteredTasks.length > 0">
+        <div class="ctp-task-card" ng-repeat="task in c.filteredTasks track by task.sys_id"
+             ng-class="{'ctp-task-closed': task.state == '3' || task.state == '4'}">
+          <div class="ctp-card-header">
+            <a href="?id=form&table=change_task&sys_id={{task.sys_id}}" 
+               class="ctp-task-link">{{task.number}}</a>
+            <span class="ctp-state-badge" ng-class="c.getStateBadgeClass(task.state)">
+              <span class="ctp-state-icon" aria-hidden="true">{{c.getStateIcon(task.state)}}</span>
+              {{c.getStateLabel(task.state)}}
+            </span>
+          </div>
+          <div class="ctp-card-body">
+            <p class="ctp-card-description">{{task.short_description}}</p>
+            <div class="ctp-card-meta">
+              <span><strong>Priority:</strong> {{task.priority_display}}</span>
+              <span><strong>Group:</strong> {{task.assignment_group_display || 'Unassigned'}}</span>
+              <span><strong>Assignee:</strong> {{task.assigned_to_display || 'Unassigned'}}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Empty Filter State -->
+      <div class="ctp-empty-filter" ng-if="c.filteredTasks.length === 0 && c.data.tasks.length > 0" role="status">
+        <span class="fa fa-search ctp-empty-filter-icon" aria-hidden="true"></span>
+        <p>No tasks match the current filter criteria.</p>
+        <button class="btn btn-link ctp-btn" ng-click="c.clearFilters()">Clear Filters</button>
+      </div>
+
+      <!-- No Tasks State -->
+      <div class="ctp-empty-filter" ng-if="c.data.tasks.length === 0" role="status">
+        <span class="fa fa-clipboard ctp-empty-filter-icon" aria-hidden="true"></span>
+        <p>No change tasks have been created for this change request.</p>
+      </div>
+    </div>
+
+    <!-- Workload Distribution -->
+    <div class="ctp-workload-section" ng-if="c.data.assignmentGroups.length > 0">
+      <h3 class="ctp-section-title">
+        <span class="fa fa-users" aria-hidden="true"></span> Workload Distribution
+      </h3>
+      <div class="ctp-workload-grid">
+        <div class="ctp-workload-card" ng-repeat="group in c.data.assignmentGroups track by group.sys_id">
+          <div class="ctp-workload-header">
+            <h4 class="ctp-workload-name">{{group.name}}</h4>
+            <span class="ctp-workload-count">{{group.taskCount}} tasks</span>
+          </div>
+          <div class="ctp-workload-bar-track">
+            <div class="ctp-workload-bar-fill" 
+                 ng-style="{'width': group.percentage + '%'}"
+                 aria-label="{{group.name}}: {{group.taskCount}} tasks ({{group.percentage}}%)">
+            </div>
+          </div>
+          <div class="ctp-workload-detail">
+            <span class="ctp-workload-stat">
+              <span class="ctp-workload-dot ctp-dot-open" aria-hidden="true"></span>
+              Open: {{group.openCount}}
+            </span>
+            <span class="ctp-workload-stat">
+              <span class="ctp-workload-dot ctp-dot-wip" aria-hidden="true"></span>
+              WIP: {{group.wipCount}}
+            </span>
+            <span class="ctp-workload-stat">
+              <span class="ctp-workload-dot ctp-dot-closed" aria-hidden="true"></span>
+              Closed: {{group.closedCount}}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recently Closed Tasks -->
+    <div class="ctp-recent-section" ng-if="c.data.recentlyClosed.length > 0">
+      <h3 class="ctp-section-title">
+        <span class="fa fa-history" aria-hidden="true"></span> Recently Closed Tasks
+      </h3>
+      <div class="ctp-recent-list" role="list">
+        <div class="ctp-recent-item" role="listitem" ng-repeat="task in c.data.recentlyClosed track by task.sys_id">
+          <div class="ctp-recent-icon-wrap">
+            <span class="fa" 
+                  ng-class="task.close_code === 'Closed Complete' ? 'fa-check-circle ctp-icon-complete' : 'fa-times-circle ctp-icon-incomplete'"
+                  aria-hidden="true"></span>
+          </div>
+          <div class="ctp-recent-body">
+            <div class="ctp-recent-top">
+              <a href="?id=form&table=change_task&sys_id={{task.sys_id}}" class="ctp-task-link">
+                {{task.number}}
+              </a>
+              <span class="ctp-recent-desc">{{task.short_description | limitTo: 60}}{{task.short_description.length > 60 ? '...' : ''}}</span>
+            </div>
+            <div class="ctp-recent-bottom">
+              <span class="ctp-recent-meta">
+                <span class="fa fa-user" aria-hidden="true"></span> {{task.closed_by_display || 'System'}}
+              </span>
+              <span class="ctp-recent-meta">
+                <span class="fa fa-clock-o" aria-hidden="true"></span> {{task.closed_at}}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Auto-refresh indicator -->
+    <div class="ctp-footer" ng-if="c.autoRefreshEnabled">
+      <span class="ctp-footer-text">
+        <span class="fa fa-circle ctp-pulse-dot" aria-hidden="true"></span>
+        Auto-refreshing every {{c.autoRefreshInterval / 1000}} seconds
+      </span>
+    </div>
+
+  </div>
+</div>]]></template>
+<u_search_keys/>
+</sp_widget>
+</unload>
